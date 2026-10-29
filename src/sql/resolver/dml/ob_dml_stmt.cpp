@@ -116,6 +116,21 @@ int TableItem::deep_copy_file_table_def(const ObFileTableDef &file_def, ObIAlloc
       file_table_def_->inode_ = file_def.inode_;
       file_table_def_->file_size_ = file_def.file_size_;
       file_table_def_->modified_time_ns_ = file_def.modified_time_ns_;
+      file_table_def_->header_ = file_def.header_;
+      file_table_def_->header_specified_ = file_def.header_specified_;
+      file_table_def_->delimiter_ = file_def.delimiter_;
+      file_table_def_->delimiter_specified_ = file_def.delimiter_specified_;
+      file_table_def_->quote_ = file_def.quote_;
+      file_table_def_->has_quote_ = file_def.has_quote_;
+      file_table_def_->escape_ = file_def.escape_;
+      file_table_def_->has_escape_ = file_def.has_escape_;
+      file_table_def_->skip_rows_ = file_def.skip_rows_;
+      file_table_def_->ignore_errors_ = file_def.ignore_errors_;
+      file_table_def_->has_explicit_columns_ = file_def.has_explicit_columns_;
+      if (OB_FAIL(ob_write_string(*allocator, file_def.null_string_,
+                                  file_table_def_->null_string_))) {
+        LOG_WARN("failed to copy null string", K(ret));
+      } else {
       const ObIArray<ObFileTableColumnDef> *src_arrays[] = {
         &file_def.columns_, &file_def.source_columns_
       };
@@ -140,6 +155,7 @@ int TableItem::deep_copy_file_table_def(const ObFileTableDef &file_def, ObIAlloc
           }
         }
       }
+    }
     }
   }
   return ret;

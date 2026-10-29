@@ -30,6 +30,28 @@ namespace sql
 {
 class ObParquetReader;
 
+struct ObFileReadOptions
+{
+  ObFileReadOptions()
+    : header_(true), header_specified_(false),
+      delimiter_(','), delimiter_specified_(false),
+      quote_('"'), has_quote_(true),
+      escape_('"'), has_escape_(true),
+      skip_rows_(0), ignore_errors_(false), null_string_()
+  {}
+  bool header_;
+  bool header_specified_;
+  char delimiter_;
+  bool delimiter_specified_;
+  char quote_;
+  bool has_quote_;
+  char escape_;
+  bool has_escape_;
+  int64_t skip_rows_;
+  bool ignore_errors_;
+  std::string null_string_;
+};
+
 struct ObFileColumnSchema
 {
   ObFileColumnSchema()
@@ -105,8 +127,37 @@ public:
                           uint64_t &inode,
                           int64_t &file_size,
                           int64_t &modified_time_ns);
+  // The options overload resolves CSV auto-detection in place: on return
+  // delimiter_/header_ contain the detected dialect used by the executor.
+  static int infer_schema(const std::string &path,
+                          ObFileFormat requested_format,
+                          ObFileReadOptions &options,
+                          std::vector<ObFileColumnSchema> &columns,
+                          int64_t &row_count,
+                          std::string &canonical_path,
+                          ObFileFormat &actual_format,
+                          uint64_t &device,
+                          uint64_t &inode,
+                          int64_t &file_size,
+                          int64_t &modified_time_ns);
+  // Explicit-schema path: validate existence/fingerprint without inference.
+  static int validate_schema_source(const std::string &path,
+                                    ObFileFormat requested_format,
+                                    std::string &canonical_path,
+                                    ObFileFormat &actual_format,
+                                    uint64_t &device,
+                                    uint64_t &inode,
+                                    int64_t &file_size,
+                                    int64_t &modified_time_ns);
+  // Counts regular files in dir that match pattern ("*" when empty).
+  static int directory_match_count(const std::string &dir,
+                                   const std::string &pattern,
+                                   int64_t &match_count);
   static const char *format_name(ObFileFormat format);
   static const char *column_type_name(ObFileColumnType type);
+  static int parse_column_type(const std::string &name,
+                               ObFileColumnType &type,
+                               int64_t &max_length);
 };
 
 class ObFileScanReader
@@ -135,6 +186,15 @@ public:
            int64_t expected_file_size,
            int64_t expected_modified_time_ns,
            const std::vector<int64_t> &projected_column_idxs);
+  int open(const std::string &path,
+           ObFileFormat format,
+           const ObFileReadOptions &options,
+           const std::vector<ObFileColumnSchema> &columns,
+           uint64_t expected_device,
+           uint64_t expected_inode,
+           int64_t expected_file_size,
+           int64_t expected_modified_time_ns,
+           const std::vector<int64_t> &projected_column_idxs);
   int get_next_row(std::vector<ObFileCell> &cells);
   int rescan();
   void close();
@@ -149,6 +209,7 @@ private:
 private:
   std::string path_;
   ObFileFormat format_;
+  ObFileReadOptions options_;
   std::vector<ObFileColumnSchema> columns_;
   std::vector<bool> projected_columns_;
   std::unique_ptr<std::streambuf> stream_buffer_;

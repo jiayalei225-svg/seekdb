@@ -60,8 +60,10 @@ bool glob_match(const std::string &pattern, const std::string &name)
 }
 } // namespace
 
-OB_SERIALIZE_MEMBER((ObFileScanSpec, ObOpSpec), kind_, file_path_, glob_pattern_, secure_file_priv_, file_format_,
-                    device_, inode_, file_size_, modified_time_ns_,
+OB_SERIALIZE_MEMBER((ObFileScanSpec, ObOpSpec), kind_, file_path_, glob_pattern_, secure_file_priv_,
+                    null_string_, file_format_, device_, inode_, file_size_, modified_time_ns_,
+                    header_, header_specified_, delimiter_, delimiter_specified_, quote_, has_quote_,
+                    escape_, has_escape_, skip_rows_, ignore_errors_, has_explicit_columns_,
                     file_column_names_, file_column_types_, source_column_names_,
                     source_original_names_, source_type_names_, source_column_types_, source_column_nullable_,
                     output_column_idxs_, column_exprs_);
@@ -85,9 +87,22 @@ int ObFileScanOp::open_scan()
   for (int64_t i = 0; OB_SUCC(ret) && i < file_spec().output_column_idxs_.count(); ++i) {
     projected_column_idxs.push_back(file_spec().output_column_idxs_.at(i));
   }
+  ObFileReadOptions options;
+  options.header_ = file_spec().header_;
+  options.header_specified_ = file_spec().header_specified_;
+  options.delimiter_ = static_cast<char>(file_spec().delimiter_);
+  options.delimiter_specified_ = file_spec().delimiter_specified_;
+  options.quote_ = static_cast<char>(file_spec().quote_);
+  options.has_quote_ = file_spec().has_quote_;
+  options.escape_ = static_cast<char>(file_spec().escape_);
+  options.has_escape_ = file_spec().has_escape_;
+  options.skip_rows_ = file_spec().skip_rows_;
+  options.ignore_errors_ = file_spec().ignore_errors_;
+  options.null_string_.assign(file_spec().null_string_.ptr(),
+                              file_spec().null_string_.length());
   if (OB_SUCC(ret) && OB_FAIL(reader_.open(
         std::string(file_spec().file_path_.ptr(), file_spec().file_path_.length()),
-        static_cast<ObFileFormat>(file_spec().file_format_), columns,
+        static_cast<ObFileFormat>(file_spec().file_format_), options, columns,
         file_spec().device_, file_spec().inode_, file_spec().file_size_,
         file_spec().modified_time_ns_, projected_column_idxs))) {
     LOG_WARN("failed to open file scan reader", K(ret), K(file_spec().file_path_));

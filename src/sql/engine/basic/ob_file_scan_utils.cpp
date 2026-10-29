@@ -29,7 +29,9 @@
 #include <limits>
 #include <list>
 #include <mutex>
+#include <sstream>
 #include <unordered_map>
+#include <dirent.h>
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/stat.h>
@@ -111,7 +113,7 @@ int open_safe_input_stream(const std::string &path,
   const int fd = open(path.c_str(), readonly_file_flags());
   struct stat file_stat;
   if (fd < 0) {
-    ret = OB_FILE_NOT_OPENED;
+    ret = ENOENT == errno ? OB_FILE_NOT_EXIST : OB_FILE_NOT_OPENED;
   } else if (0 != fstat(fd, &file_stat) || !S_ISREG(file_stat.st_mode)) {
     close(fd);
     ret = OB_INVALID_DATA;
@@ -175,9 +177,29 @@ struct SchemaCacheEntry
   uint64_t inode_;
   int64_t size_;
   int64_t mtime_ns_;
+  std::string options_key_;
+  char delimiter_;
+  bool header_;
   std::vector<ObFileColumnSchema> columns_;
   int64_t row_count_;
 };
+
+std::string make_options_key(const ObFileReadOptions &options)
+{
+  std::string key;
+  key.append(options.header_specified_ ? "1" : "0").append(":");
+  key.append(options.header_ ? "1" : "0").append(":");
+  key.append(options.delimiter_specified_ ? "1" : "0").append(":");
+  key.append(std::to_string(static_cast<int>(options.delimiter_))).append(":");
+  key.append(std::to_string(static_cast<int>(options.quote_))).append(":");
+  key.append(options.has_quote_ ? "1" : "0").append(":");
+  key.append(std::to_string(static_cast<int>(options.escape_))).append(":");
+  key.append(options.has_escape_ ? "1" : "0").append(":");
+  key.append(std::to_string(static_cast<long long>(options.skip_rows_))).append(":");
+  key.append(options.ignore_errors_ ? "1" : "0").append(":");
+  key.append(options.null_string_);
+  return key;
+}
 
 class SchemaCache
 {
@@ -185,16 +207,21 @@ public:
   bool get(const std::string &path, const ObFileFormat format,
            const uint64_t device, const uint64_t inode,
            const int64_t size, const int64_t mtime_ns,
-           std::vector<ObFileColumnSchema> &columns, int64_t &row_count)
+           const std::string &options_key,
+           std::vector<ObFileColumnSchema> &columns, int64_t &row_count,
+           char &delimiter, bool &header)
   {
     bool found = false;
     std::lock_guard<std::mutex> guard(lock_);
     for (auto it = entries_.begin(); !found && it != entries_.end(); ++it) {
       if (it->path_ == path && it->format_ == format
           && it->device_ == device && it->inode_ == inode
-          && it->size_ == size && it->mtime_ns_ == mtime_ns) {
+          && it->size_ == size && it->mtime_ns_ == mtime_ns
+          && it->options_key_ == options_key) {
         columns = it->columns_;
         row_count = it->row_count_;
+        delimiter = it->delimiter_;
+        header = it->header_;
         entries_.splice(entries_.begin(), entries_, it);
         found = true;
       }
@@ -205,6 +232,7 @@ public:
   void put(const std::string &path, const ObFileFormat format,
            const uint64_t device, const uint64_t inode,
            const int64_t size, const int64_t mtime_ns,
+           const std::string &options_key, const char delimiter, const bool header,
            const std::vector<ObFileColumnSchema> &columns, const int64_t row_count)
   {
     SchemaCacheEntry entry;
@@ -214,13 +242,17 @@ public:
     entry.inode_ = inode;
     entry.size_ = size;
     entry.mtime_ns_ = mtime_ns;
+    entry.options_key_ = options_key;
+    entry.delimiter_ = delimiter;
+    entry.header_ = header;
     entry.columns_ = columns;
     entry.row_count_ = row_count;
     std::lock_guard<std::mutex> guard(lock_);
     for (auto it = entries_.begin(); it != entries_.end();) {
       if (it->path_ == path && it->format_ == format
           && it->device_ == device && it->inode_ == inode
-          && it->size_ == size && it->mtime_ns_ == mtime_ns) {
+          && it->size_ == size && it->mtime_ns_ == mtime_ns
+          && it->options_key_ == options_key) {
         it = entries_.erase(it);
       } else {
         ++it;
@@ -291,10 +323,18 @@ bool is_blank_line(const std::string &line)
   return blank;
 }
 
-int read_csv_record(std::istream &stream, std::vector<std::string> &fields, bool &has_record)
+int read_csv_record(std::istream &stream,
+                    const ObFileReadOptions &options,
+                    std::vector<std::string> &fields,
+                    std::vector<bool> &quoted_fields,
+                    bool &has_record)
 {
   int ret = OB_SUCCESS;
+  const char delimiter = options.delimiter_;
+  const char quote = options.has_quote_ ? options.quote_ : '\0';
+  const char escape = options.has_escape_ ? options.escape_ : '\0';
   fields.clear();
+  quoted_fields.clear();
   has_record = false;
   std::string field;
   bool in_quotes = false;
@@ -310,6 +350,7 @@ int read_csv_record(std::istream &stream, std::vector<std::string> &fields, bool
         ret = OB_ITER_END;
       } else {
         fields.push_back(field);
+        quoted_fields.push_back(quoted_field);
         has_record = true;
       }
       break;
@@ -317,58 +358,81 @@ int read_csv_record(std::istream &stream, std::vector<std::string> &fields, bool
     has_record = true;
     const char ch = static_cast<char>(next);
     if (in_quotes) {
-      if ('"' == ch) {
-        if ('"' == stream.peek()) {
+      if (0 != escape && escape != quote && ch == escape) {
+        const int escaped = stream.get();
+        if (std::char_traits<char>::eof() == escaped) {
+          ret = OB_INVALID_DATA;
+        } else {
+          field.push_back(static_cast<char>(escaped));
+        }
+      } else if (0 != quote && ch == quote) {
+        if (0 != escape && escape == quote && quote == stream.peek()) {
           stream.get();
-          field.push_back('"');
+          field.push_back(quote);
         } else {
           in_quotes = false;
           after_quote = true;
         }
       } else {
         field.push_back(ch);
-        if (field.length() > static_cast<size_t>(MAX_FIELD_SIZE)) {
-          ret = OB_SIZE_OVERFLOW;
-        }
+      }
+      if (OB_SUCC(ret) && field.length() > static_cast<size_t>(MAX_FIELD_SIZE)) {
+        ret = OB_SIZE_OVERFLOW;
       }
     } else if (after_quote) {
-      if (',' == ch) {
+      if (ch == delimiter) {
         fields.push_back(field);
+        quoted_fields.push_back(quoted_field);
         field.clear();
         quoted_field = false;
         after_quote = false;
         first_char = true;
       } else if ('\n' == ch) {
         fields.push_back(field);
+        quoted_fields.push_back(quoted_field);
         break;
       } else if ('\r' == ch) {
         if ('\n' == stream.peek()) {
           stream.get();
         }
         fields.push_back(field);
+        quoted_fields.push_back(quoted_field);
         break;
+      } else if (' ' == ch || '\t' == ch) {
+        // tolerate trailing blanks after a closing quote
       } else {
         ret = OB_INVALID_DATA;
       }
-    } else if (first_char && '"' == ch) {
+    } else if (first_char && 0 != quote && quote == ch) {
       in_quotes = true;
       quoted_field = true;
       first_char = false;
-    } else if (',' == ch) {
+    } else if (ch == delimiter) {
       fields.push_back(field);
+      quoted_fields.push_back(quoted_field);
       field.clear();
       quoted_field = false;
       first_char = true;
     } else if ('\n' == ch) {
       fields.push_back(field);
+      quoted_fields.push_back(quoted_field);
       break;
     } else if ('\r' == ch) {
       if ('\n' == stream.peek()) {
         stream.get();
       }
       fields.push_back(field);
+      quoted_fields.push_back(quoted_field);
       break;
-    } else if ('"' == ch && !quoted_field) {
+    } else if (0 != escape && escape != quote && ch == escape) {
+      const int escaped = stream.get();
+      if (std::char_traits<char>::eof() == escaped) {
+        ret = OB_INVALID_DATA;
+      } else {
+        field.push_back(static_cast<char>(escaped));
+      }
+      first_char = false;
+    } else if (0 != quote && ch == quote) {
       ret = OB_INVALID_DATA;
     } else {
       field.push_back(ch);
@@ -379,6 +443,35 @@ int read_csv_record(std::istream &stream, std::vector<std::string> &fields, bool
     }
   }
   return ret;
+}
+
+std::string trim_ascii_blanks(const std::string &text)
+{
+  size_t begin = 0;
+  size_t end = text.length();
+  while (begin < end && (' ' == text[begin] || '\t' == text[begin])) {
+    ++begin;
+  }
+  while (end > begin && (' ' == text[end - 1] || '\t' == text[end - 1])) {
+    --end;
+  }
+  return text.substr(begin, end - begin);
+}
+
+int type_rank(const ObFileColumnType type)
+{
+  int rank = -1;
+  switch (type) {
+    case ObFileColumnType::NULL_TYPE: rank = 0; break;
+    case ObFileColumnType::BOOLEAN: rank = 1; break;
+    case ObFileColumnType::BIGINT: rank = 2; break;
+    case ObFileColumnType::DOUBLE: rank = 3; break;
+    case ObFileColumnType::DATE: rank = 4; break;
+    case ObFileColumnType::DATETIME: rank = 5; break;
+    case ObFileColumnType::VARCHAR: rank = 6; break;
+    default: rank = -1; break;
+  }
+  return rank;
 }
 
 bool parse_strict_date(const std::string &text, int32_t &date_value)
@@ -420,38 +513,45 @@ bool parse_strict_datetime(const std::string &text, int64_t &datetime_value)
   return valid;
 }
 
-ParsedValue parse_csv_value(const std::string &text)
+ParsedValue parse_csv_value(const std::string &text,
+                            const bool quoted,
+                            const std::string &null_string)
 {
   ParsedValue value;
   value.text_ = text;
-  if (text.empty()) {
+  if (!quoted && (text.empty() || (!null_string.empty() && text == null_string))) {
     value.type_ = ObFileColumnType::NULL_TYPE;
-  } else if (ascii_iequal(text, "true") || ascii_iequal(text, "false")) {
-    value.type_ = ObFileColumnType::BOOLEAN;
-    value.bool_value_ = ascii_iequal(text, "true");
   } else {
-    char *end = nullptr;
-    errno = 0;
-    const long long int_value = std::strtoll(text.c_str(), &end, 10);
-    if (0 == errno && end == text.c_str() + text.length()) {
-      value.type_ = ObFileColumnType::BIGINT;
-      value.int_value_ = static_cast<int64_t>(int_value);
+    const std::string trimmed = trim_ascii_blanks(text);
+    if (trimmed.empty()) {
+      value.type_ = ObFileColumnType::NULL_TYPE;
+    } else if (ascii_iequal(trimmed, "true") || ascii_iequal(trimmed, "false")) {
+      value.type_ = ObFileColumnType::BOOLEAN;
+      value.bool_value_ = ascii_iequal(trimmed, "true");
     } else {
+      char *end = nullptr;
       errno = 0;
-      end = nullptr;
-      const double double_value = std::strtod(text.c_str(), &end);
-      if (0 == errno && end == text.c_str() + text.length() && std::isfinite(double_value)) {
-        value.type_ = ObFileColumnType::DOUBLE;
-        value.double_value_ = double_value;
+      const long long int_value = std::strtoll(trimmed.c_str(), &end, 10);
+      if (0 == errno && end == trimmed.c_str() + trimmed.length()) {
+        value.type_ = ObFileColumnType::BIGINT;
+        value.int_value_ = static_cast<int64_t>(int_value);
       } else {
-        int32_t date_value = 0;
-        int64_t datetime_value = 0;
-        if (parse_strict_date(text, date_value)) {
-          value.type_ = ObFileColumnType::DATE;
-        } else if (parse_strict_datetime(text, datetime_value)) {
-          value.type_ = ObFileColumnType::DATETIME;
+        errno = 0;
+        end = nullptr;
+        const double double_value = std::strtod(trimmed.c_str(), &end);
+        if (0 == errno && end == trimmed.c_str() + trimmed.length() && std::isfinite(double_value)) {
+          value.type_ = ObFileColumnType::DOUBLE;
+          value.double_value_ = double_value;
         } else {
-          value.type_ = ObFileColumnType::VARCHAR;
+          int32_t date_value = 0;
+          int64_t datetime_value = 0;
+          if (parse_strict_date(trimmed, date_value)) {
+            value.type_ = ObFileColumnType::DATE;
+          } else if (parse_strict_datetime(trimmed, datetime_value)) {
+            value.type_ = ObFileColumnType::DATETIME;
+          } else {
+            value.type_ = ObFileColumnType::VARCHAR;
+          }
         }
       }
     }
@@ -466,14 +566,22 @@ ObFileColumnType merge_type(const ObFileColumnType old_type, const ObFileColumnT
     result = new_type;
   } else if (ObFileColumnType::NULL_TYPE == new_type || old_type == new_type) {
     // keep old type
-  } else if ((ObFileColumnType::BIGINT == old_type && ObFileColumnType::DOUBLE == new_type)
-          || (ObFileColumnType::DOUBLE == old_type && ObFileColumnType::BIGINT == new_type)) {
-    result = ObFileColumnType::DOUBLE;
-  } else if ((ObFileColumnType::DATE == old_type && ObFileColumnType::DATETIME == new_type)
-          || (ObFileColumnType::DATETIME == old_type && ObFileColumnType::DATE == new_type)) {
-    result = ObFileColumnType::DATETIME;
   } else {
-    result = ObFileColumnType::VARCHAR;
+    const bool old_numeric = ObFileColumnType::BOOLEAN == old_type
+                          || ObFileColumnType::BIGINT == old_type
+                          || ObFileColumnType::DOUBLE == old_type;
+    const bool new_numeric = ObFileColumnType::BOOLEAN == new_type
+                          || ObFileColumnType::BIGINT == new_type
+                          || ObFileColumnType::DOUBLE == new_type;
+    if (old_numeric && new_numeric) {
+      // BOOLEAN -> BIGINT -> DOUBLE numeric ladder.
+      result = type_rank(old_type) >= type_rank(new_type) ? old_type : new_type;
+    } else if ((ObFileColumnType::DATE == old_type && ObFileColumnType::DATETIME == new_type)
+               || (ObFileColumnType::DATETIME == old_type && ObFileColumnType::DATE == new_type)) {
+      result = ObFileColumnType::DATETIME;
+    } else {
+      result = ObFileColumnType::VARCHAR;
+    }
   }
   return result;
 }
@@ -619,29 +727,71 @@ int convert_value(const ParsedValue &value, const ObFileColumnType target_type, 
     // keep null
   } else {
     cell.is_null_ = false;
+    const std::string trimmed = trim_ascii_blanks(value.text_);
     switch (target_type) {
       case ObFileColumnType::BOOLEAN:
-        cell.bool_value_ = value.bool_value_;
+        if (ObFileColumnType::BOOLEAN == value.type_) {
+          cell.bool_value_ = value.bool_value_;
+        } else if (ObFileColumnType::BIGINT == value.type_) {
+          cell.bool_value_ = 0 != value.int_value_;
+        } else if (ObFileColumnType::DOUBLE == value.type_) {
+          cell.bool_value_ = 0 != value.double_value_;
+        } else if (ascii_iequal(trimmed, "true") || ascii_iequal(trimmed, "1")) {
+          cell.bool_value_ = true;
+        } else if (ascii_iequal(trimmed, "false") || ascii_iequal(trimmed, "0")) {
+          cell.bool_value_ = false;
+        } else {
+          ret = OB_INVALID_DATA;
+        }
         break;
       case ObFileColumnType::BIGINT:
-        cell.int_value_ = value.int_value_;
+        if (ObFileColumnType::BOOLEAN == value.type_) {
+          cell.int_value_ = value.bool_value_ ? 1 : 0;
+        } else if (ObFileColumnType::BIGINT == value.type_) {
+          cell.int_value_ = value.int_value_;
+        } else if (ObFileColumnType::DOUBLE == value.type_) {
+          cell.int_value_ = static_cast<int64_t>(value.double_value_);
+        } else {
+          char *end = nullptr;
+          errno = 0;
+          const long long parsed = std::strtoll(trimmed.c_str(), &end, 10);
+          if (0 == errno && end == trimmed.c_str() + trimmed.length()) {
+            cell.int_value_ = static_cast<int64_t>(parsed);
+          } else {
+            ret = OB_INVALID_DATA;
+          }
+        }
         break;
       case ObFileColumnType::DOUBLE:
-        cell.double_value_ = ObFileColumnType::BIGINT == value.type_
-            ? static_cast<double>(value.int_value_) : value.double_value_;
+        if (ObFileColumnType::BOOLEAN == value.type_) {
+          cell.double_value_ = value.bool_value_ ? 1.0 : 0.0;
+        } else if (ObFileColumnType::BIGINT == value.type_) {
+          cell.double_value_ = static_cast<double>(value.int_value_);
+        } else if (ObFileColumnType::DOUBLE == value.type_) {
+          cell.double_value_ = value.double_value_;
+        } else {
+          char *end = nullptr;
+          errno = 0;
+          const double parsed = std::strtod(trimmed.c_str(), &end);
+          if (0 == errno && end == trimmed.c_str() + trimmed.length() && std::isfinite(parsed)) {
+            cell.double_value_ = parsed;
+          } else {
+            ret = OB_INVALID_DATA;
+          }
+        }
         break;
       case ObFileColumnType::DATE:
-        if (!parse_strict_date(value.text_, cell.date_value_)) {
+        if (!parse_strict_date(trimmed, cell.date_value_)) {
           ret = OB_INVALID_DATA;
         }
         break;
       case ObFileColumnType::DATETIME: {
         if (ObFileColumnType::DATE == value.type_) {
-          std::string datetime_text = value.text_ + " 00:00:00";
+          std::string datetime_text = trimmed + " 00:00:00";
           if (!parse_strict_datetime(datetime_text, cell.datetime_value_)) {
             ret = OB_INVALID_DATA;
           }
-        } else if (!parse_strict_datetime(value.text_, cell.datetime_value_)) {
+        } else if (!parse_strict_datetime(trimmed, cell.datetime_value_)) {
           ret = OB_INVALID_DATA;
         }
         break;
@@ -660,7 +810,110 @@ int convert_value(const ParsedValue &value, const ObFileColumnType target_type, 
   return ret;
 }
 
+int skip_physical_lines(std::istream &stream, const int64_t line_count)
+{
+  int ret = OB_SUCCESS;
+  std::string line;
+  for (int64_t i = 0; OB_SUCC(ret) && i < line_count; ++i) {
+    if (!std::getline(stream, line)) {
+      ret = OB_INVALID_DATA;
+    }
+  }
+  return ret;
+}
+
+char detect_delimiter(std::istream &stream,
+                      const ObFileReadOptions &options)
+{
+  static const char CANDIDATES[] = { ',', '\t', ';', '|' };
+  std::vector<std::string> lines;
+  std::string line;
+  for (int64_t i = 0; i < 8 && std::getline(stream, line); ++i) {
+    if (!line.empty() && '\r' == line.back()) {
+      line.pop_back();
+    }
+    if (!line.empty()) {
+      lines.push_back(line);
+    }
+  }
+  char best = ',';
+  int64_t best_consistency = 0;
+  int64_t best_columns = 1;
+  for (size_t candidate_idx = 0; candidate_idx < sizeof(CANDIDATES); ++candidate_idx) {
+    ObFileReadOptions probe = options;
+    probe.delimiter_ = CANDIDATES[candidate_idx];
+    int64_t modal_count = 0;
+    int64_t modal_frequency = 0;
+    bool parsed_all = true;
+    for (size_t i = 0; i < lines.size() && parsed_all; ++i) {
+      std::istringstream input(lines[i]);
+      std::vector<std::string> fields;
+      std::vector<bool> quoted;
+      bool has_record = false;
+      const int parse_ret = read_csv_record(input, probe, fields, quoted, has_record);
+      if (OB_SUCCESS != parse_ret || !has_record) {
+        parsed_all = false;
+      } else {
+        int64_t frequency = 0;
+        for (size_t j = 0; j < lines.size(); ++j) {
+          std::istringstream other(lines[j]);
+          std::vector<std::string> other_fields;
+          std::vector<bool> other_quoted;
+          bool other_record = false;
+          if (OB_SUCCESS == read_csv_record(other, probe, other_fields, other_quoted, other_record)
+              && other_record
+              && other_fields.size() == fields.size()) {
+            ++frequency;
+          }
+        }
+        if (frequency > modal_frequency) {
+          modal_frequency = frequency;
+          modal_count = static_cast<int64_t>(fields.size());
+        }
+      }
+    }
+    if (!parsed_all || modal_count <= 1 || lines.empty()) {
+      continue;
+    }
+    if (modal_frequency > best_consistency
+        || (modal_frequency == best_consistency && modal_count > best_columns)) {
+      best_consistency = modal_frequency;
+      best_columns = modal_count;
+      best = CANDIDATES[candidate_idx];
+    }
+  }
+  return best;
+}
+
+bool csv_record_looks_like_header(const std::vector<std::string> &fields,
+                                  const std::vector<bool> &quoted)
+{
+  bool looks = !fields.empty();
+  for (size_t i = 0; looks && i < fields.size(); ++i) {
+    const ParsedValue value = parse_csv_value(fields[i],
+                                              i < quoted.size() ? quoted[i] : false,
+                                              std::string());
+    looks = ObFileColumnType::VARCHAR == value.type_;
+  }
+  return looks;
+}
+
+bool csv_record_has_typed_value(const std::vector<std::string> &fields,
+                                const std::vector<bool> &quoted)
+{
+  bool typed = false;
+  for (size_t i = 0; !typed && i < fields.size(); ++i) {
+    const ParsedValue value = parse_csv_value(fields[i],
+                                              i < quoted.size() ? quoted[i] : false,
+                                              std::string());
+    typed = ObFileColumnType::NULL_TYPE != value.type_
+            && ObFileColumnType::VARCHAR != value.type_;
+  }
+  return typed;
+}
+
 int infer_csv_schema(const std::string &path,
+                     ObFileReadOptions &options,
                      std::vector<ObFileColumnSchema> &columns,
                      int64_t &row_count)
 {
@@ -668,54 +921,140 @@ int infer_csv_schema(const std::string &path,
   std::unique_ptr<std::streambuf> stream_buffer;
   std::unique_ptr<std::istream> stream;
   std::vector<std::string> fields;
+  std::vector<bool> quoted;
   bool has_record = false;
   columns.clear();
   row_count = 0;
   if (OB_FAIL(open_safe_input_stream(path, stream_buffer, stream))) {
     LOG_WARN("failed to safely open csv file", K(ret));
-  } else if (OB_FAIL(read_csv_record(*stream, fields, has_record))) {
+  } else {
+    if (!options.delimiter_specified_) {
+      options.delimiter_ = detect_delimiter(*stream, options);
+      stream.reset();
+      stream_buffer.reset();
+      if (OB_FAIL(open_safe_input_stream(path, stream_buffer, stream))) {
+        LOG_WARN("failed to reopen csv file", K(ret));
+      }
+    }
+  }
+  if (OB_SUCC(ret) && OB_FAIL(skip_physical_lines(*stream, options.skip_rows_))) {
+    LOG_WARN("failed to skip csv rows", K(ret), K(options.skip_rows_));
+  }
+  std::vector<std::string> first_fields;
+  std::vector<bool> first_quoted;
+  std::vector<std::string> second_fields;
+  std::vector<bool> second_quoted;
+  bool has_first = false;
+  bool has_second = false;
+  if (OB_FAIL(ret)) {
+  } else if (OB_FAIL(read_csv_record(*stream, options, fields, quoted, has_record))) {
     if (OB_ITER_END == ret) {
       ret = OB_INVALID_DATA;
     }
   } else {
-    for (size_t i = 0; i < fields.size(); ++i) {
-      ObFileColumnSchema column;
-      if (0 == i && fields[i].length() >= 3
-          && static_cast<unsigned char>(fields[i][0]) == 0xEF
-          && static_cast<unsigned char>(fields[i][1]) == 0xBB
-          && static_cast<unsigned char>(fields[i][2]) == 0xBF) {
-        fields[i].erase(0, 3);
+    has_first = has_record;
+    first_fields.swap(fields);
+    first_quoted.swap(quoted);
+  }
+  if (OB_SUCC(ret) && has_first && !options.header_specified_) {
+    fields.clear();
+    quoted.clear();
+    has_record = false;
+    const int second_ret = read_csv_record(*stream, options, fields, quoted, has_record);
+    if (OB_SUCC(second_ret) && has_record) {
+      has_second = true;
+      second_fields.swap(fields);
+      second_quoted.swap(quoted);
+    } else if (OB_ITER_END != second_ret) {
+      ret = second_ret;
+    }
+  }
+  if (OB_SUCC(ret) && has_first) {
+    bool header = options.header_;
+    if (!options.header_specified_) {
+      header = csv_record_looks_like_header(first_fields, first_quoted);
+      if (header && has_second) {
+        header = csv_record_has_typed_value(second_fields, second_quoted);
       }
-      column.source_name_ = fields[i];
-      column.column_name_ = make_unique_column_name(fields[i], i, columns);
+    }
+    options.header_ = header;
+    const std::vector<std::string> &name_fields = first_fields;
+    const size_t column_count = name_fields.size();
+    for (size_t i = 0; OB_SUCC(ret) && i < column_count; ++i) {
+      ObFileColumnSchema column;
+      std::string name = name_fields[i];
+      if (header && 0 == i && name.length() >= 3
+          && static_cast<unsigned char>(name[0]) == 0xEF
+          && static_cast<unsigned char>(name[1]) == 0xBB
+          && static_cast<unsigned char>(name[2]) == 0xBF) {
+        name.erase(0, 3);
+      }
+      if (!header) {
+        name = "column" + std::to_string(i);
+      }
+      column.source_name_ = header ? name : ("column" + std::to_string(i));
+      column.column_name_ = make_unique_column_name(name, i, columns);
       columns.push_back(column);
       if (columns.size() > static_cast<size_t>(MAX_COLUMN_COUNT)) {
         ret = OB_SIZE_OVERFLOW;
       }
     }
-  }
-  while (OB_SUCC(ret)) {
-    fields.clear();
-    has_record = false;
-    ret = read_csv_record(*stream, fields, has_record);
-    if (OB_ITER_END == ret) {
-      ret = OB_SUCCESS;
-      break;
-    } else if (OB_FAIL(ret)) {
-      break;
-    } else if (fields.size() > columns.size()) {
-      ret = OB_INVALID_DATA;
-    } else {
-      ++row_count;
-      for (size_t i = 0; i < columns.size(); ++i) {
-        const ParsedValue value = i < fields.size() ? parse_csv_value(fields[i]) : ParsedValue();
-        columns[i].nullable_ = columns[i].nullable_ || ObFileColumnType::NULL_TYPE == value.type_;
-        columns[i].type_ = merge_type(columns[i].type_, value.type_);
-        columns[i].max_length_ = std::max(columns[i].max_length_, static_cast<int64_t>(value.text_.length()));
+    int64_t data_row_number = 0;
+    auto process_record = [&](const std::vector<std::string> &record_fields,
+                              const std::vector<bool> &record_quoted) -> int {
+      int process_ret = OB_SUCCESS;
+      if (record_fields.size() != columns.size()) {
+        if (options.ignore_errors_) {
+          // Skip the malformed row.
+        } else {
+          ++data_row_number;
+          process_ret = OB_ERR_WRONG_VALUE_COUNT_ON_ROW;
+          LOG_WARN("csv field count mismatch", K(process_ret), K(data_row_number),
+                   "expected", columns.size(), "actual", record_fields.size());
+          LOG_USER_ERROR(OB_ERR_WRONG_VALUE_COUNT_ON_ROW,
+                         static_cast<int>(data_row_number));
+        }
+      } else {
+        ++data_row_number;
+        ++row_count;
+        for (size_t i = 0; OB_SUCC(process_ret) && i < columns.size(); ++i) {
+          const ParsedValue value = parse_csv_value(record_fields[i],
+                                                    i < record_quoted.size() && record_quoted[i],
+                                                    options.null_string_);
+          columns[i].nullable_ = columns[i].nullable_
+                                 || ObFileColumnType::NULL_TYPE == value.type_;
+          columns[i].type_ = merge_type(columns[i].type_, value.type_);
+          columns[i].max_length_ = std::max(columns[i].max_length_,
+                                            static_cast<int64_t>(value.text_.length()));
+        }
+      }
+      return process_ret;
+    };
+    if (!header) {
+      ret = process_record(first_fields, first_quoted);
+    }
+    if (OB_SUCC(ret) && has_second) {
+      ret = process_record(second_fields, second_quoted);
+    }
+    while (OB_SUCC(ret)) {
+      fields.clear();
+      quoted.clear();
+      has_record = false;
+      const int read_ret = read_csv_record(*stream, options, fields, quoted, has_record);
+      if (OB_ITER_END == read_ret) {
+        break;
+      } else if (OB_FAIL(read_ret)) {
+        ret = read_ret;
+      } else {
+        ret = process_record(fields, quoted);
       }
     }
   }
   for (size_t i = 0; OB_SUCC(ret) && i < columns.size(); ++i) {
+    if (ObFileColumnType::NULL_TYPE == columns[i].type_) {
+      columns[i].type_ = ObFileColumnType::VARCHAR;
+      columns[i].nullable_ = true;
+    }
     columns[i].source_type_name_ = std::string("CSV/")
                                  + ObFileScanUtils::column_type_name(columns[i].type_);
   }
@@ -793,6 +1132,10 @@ int infer_jsonl_schema(const std::string &path,
     ret = OB_IO_ERROR;
   }
   for (size_t i = 0; OB_SUCC(ret) && i < columns.size(); ++i) {
+    if (ObFileColumnType::NULL_TYPE == columns[i].type_) {
+      columns[i].type_ = ObFileColumnType::VARCHAR;
+      columns[i].nullable_ = true;
+    }
     columns[i].source_type_name_ = std::string("JSON/")
                                  + ObFileScanUtils::column_type_name(columns[i].type_);
   }
@@ -841,14 +1184,14 @@ int ObFileScanUtils::canonicalize_path(const std::string &path, std::string &can
 #ifdef _WIN32
   char resolved_path[_MAX_PATH];
   if (nullptr == _fullpath(resolved_path, path.c_str(), sizeof(resolved_path))) {
-    ret = OB_FILE_NOT_OPENED;
+    ret = ENOENT == errno ? OB_FILE_NOT_EXIST : OB_FILE_NOT_OPENED;
   } else {
     canonical_path.assign(resolved_path);
   }
 #else
   char resolved_path[PATH_MAX];
   if (nullptr == realpath(path.c_str(), resolved_path)) {
-    ret = OB_FILE_NOT_OPENED;
+    ret = ENOENT == errno ? OB_FILE_NOT_EXIST : OB_FILE_NOT_OPENED;
   } else {
     canonical_path.assign(resolved_path);
   }
@@ -882,7 +1225,7 @@ int get_path_fingerprint(const std::string &path,
   if (OB_FAIL(ObFileScanUtils::canonicalize_path(path, canonical_path))) {
     LOG_WARN("failed to canonicalize file path", K(ret));
   } else if (0 != stat(canonical_path.c_str(), &path_stat)) {
-    ret = OB_FILE_NOT_OPENED;
+    ret = ENOENT == errno ? OB_FILE_NOT_EXIST : OB_FILE_NOT_OPENED;
   } else if ((require_directory && !S_ISDIR(path_stat.st_mode))
              || (!require_directory && !S_ISREG(path_stat.st_mode))) {
     ret = OB_INVALID_DATA;
@@ -952,6 +1295,23 @@ int ObFileScanUtils::infer_schema(const std::string &path,
                                   int64_t &file_size,
                                   int64_t &modified_time_ns)
 {
+  ObFileReadOptions options;
+  return infer_schema(path, requested_format, options, columns, row_count, canonical_path,
+                      actual_format, device, inode, file_size, modified_time_ns);
+}
+
+int ObFileScanUtils::infer_schema(const std::string &path,
+                                  ObFileFormat requested_format,
+                                  ObFileReadOptions &options,
+                                  std::vector<ObFileColumnSchema> &columns,
+                                  int64_t &row_count,
+                                  std::string &canonical_path,
+                                  ObFileFormat &actual_format,
+                                  uint64_t &device,
+                                  uint64_t &inode,
+                                  int64_t &file_size,
+                                  int64_t &modified_time_ns)
+{
   int ret = OB_SUCCESS;
   uint64_t initial_device = 0;
   uint64_t initial_inode = 0;
@@ -961,6 +1321,7 @@ int ObFileScanUtils::infer_schema(const std::string &path,
   uint64_t verified_inode = 0;
   bool cache_hit = false;
   std::string verified_path;
+  std::string options_key;
   if (OB_FAIL(get_file_fingerprint(path, canonical_path, initial_device, initial_inode,
                                    initial_file_size, initial_modified_time_ns))) {
     LOG_WARN("failed to fingerprint file scan path", K(ret));
@@ -974,13 +1335,18 @@ int ObFileScanUtils::infer_schema(const std::string &path,
     if (ObFileFormat::AUTO != requested_format) {
       actual_format = requested_format;
     }
+    options_key = make_options_key(options);
+    char cached_delimiter = options.delimiter_;
+    bool cached_header = options.header_;
     if ((cache_hit = schema_cache().get(
            canonical_path, actual_format, initial_device, initial_inode,
-           initial_file_size, initial_modified_time_ns, columns, row_count))) {
-      // bounded process-local cache hit
+           initial_file_size, initial_modified_time_ns, options_key,
+           columns, row_count, cached_delimiter, cached_header))) {
+      options.delimiter_ = cached_delimiter;
+      options.header_ = cached_header;
     } else switch (actual_format) {
       case ObFileFormat::CSV:
-        ret = infer_csv_schema(canonical_path, columns, row_count);
+        ret = infer_csv_schema(canonical_path, options, columns, row_count);
         break;
       case ObFileFormat::JSONL:
         ret = infer_jsonl_schema(canonical_path, columns, row_count);
@@ -1009,9 +1375,33 @@ int ObFileScanUtils::infer_schema(const std::string &path,
       inode = verified_inode;
       if (!cache_hit) {
         schema_cache().put(canonical_path, actual_format, device, inode,
-                           file_size, modified_time_ns, columns, row_count);
+                           file_size, modified_time_ns, options_key,
+                           options.delimiter_, options.header_, columns, row_count);
       }
     }
+  }
+  return ret;
+}
+
+int ObFileScanUtils::validate_schema_source(const std::string &path,
+                                            ObFileFormat requested_format,
+                                            std::string &canonical_path,
+                                            ObFileFormat &actual_format,
+                                            uint64_t &device,
+                                            uint64_t &inode,
+                                            int64_t &file_size,
+                                            int64_t &modified_time_ns)
+{
+  int ret = OB_SUCCESS;
+  if (OB_FAIL(get_file_fingerprint(path, canonical_path, device, inode,
+                                   file_size, modified_time_ns))) {
+    LOG_WARN("failed to fingerprint explicit-schema source", K(ret));
+  } else if (file_size > MAX_FILE_SIZE) {
+    ret = OB_SIZE_OVERFLOW;
+  } else if (ObFileFormat::AUTO == requested_format) {
+    ret = detect_format(canonical_path, actual_format);
+  } else {
+    actual_format = requested_format;
   }
   return ret;
 }
@@ -1045,8 +1435,124 @@ const char *ObFileScanUtils::column_type_name(const ObFileColumnType type)
   return name;
 }
 
+int ObFileScanUtils::parse_column_type(const std::string &name,
+                                       ObFileColumnType &type,
+                                       int64_t &max_length)
+{
+  int ret = OB_SUCCESS;
+  std::string normalized = trim_ascii_blanks(name);
+  for (size_t i = 0; i < normalized.length(); ++i) {
+    normalized[i] = static_cast<char>(std::tolower(static_cast<unsigned char>(normalized[i])));
+  }
+  max_length = 0;
+  const size_t paren = normalized.find('(');
+  if (std::string::npos != paren) {
+    const size_t close = normalized.find(')', paren);
+    if (std::string::npos != close) {
+      const std::string length_text = normalized.substr(paren + 1, close - paren - 1);
+      char *end = nullptr;
+      const long long length = std::strtoll(length_text.c_str(), &end, 10);
+      if (nullptr != end && end == length_text.c_str() + length_text.length()
+          && length > 0) {
+        max_length = length;
+      }
+    }
+    normalized = normalized.substr(0, paren);
+  }
+  if (ascii_iequal(normalized, "int") || ascii_iequal(normalized, "integer")
+      || ascii_iequal(normalized, "bigint") || ascii_iequal(normalized, "int64")
+      || ascii_iequal(normalized, "signed")) {
+    type = ObFileColumnType::BIGINT;
+  } else if (ascii_iequal(normalized, "double") || ascii_iequal(normalized, "float")
+             || ascii_iequal(normalized, "real") || ascii_iequal(normalized, "number")
+             || ascii_iequal(normalized, "decimal")) {
+    type = ObFileColumnType::DOUBLE;
+  } else if (ascii_iequal(normalized, "bool") || ascii_iequal(normalized, "boolean")) {
+    type = ObFileColumnType::BOOLEAN;
+  } else if (ascii_iequal(normalized, "date")) {
+    type = ObFileColumnType::DATE;
+  } else if (ascii_iequal(normalized, "datetime") || ascii_iequal(normalized, "timestamp")) {
+    type = ObFileColumnType::DATETIME;
+  } else if (ascii_iequal(normalized, "varchar") || ascii_iequal(normalized, "char")
+             || ascii_iequal(normalized, "string") || ascii_iequal(normalized, "text")) {
+    type = ObFileColumnType::VARCHAR;
+    if (max_length <= 0) {
+      max_length = 4096;
+    }
+  } else {
+    ret = OB_NOT_SUPPORTED;
+  }
+  return ret;
+}
+
+namespace
+{
+bool utils_glob_match(const std::string &pattern, const std::string &name)
+{
+  size_t pattern_pos = 0;
+  size_t name_pos = 0;
+  size_t star_pos = std::string::npos;
+  size_t star_name_pos = 0;
+  while (name_pos < name.length()) {
+    if (pattern_pos < pattern.length()
+        && (pattern[pattern_pos] == '?' || pattern[pattern_pos] == name[name_pos])) {
+      ++pattern_pos;
+      ++name_pos;
+    } else if (pattern_pos < pattern.length() && pattern[pattern_pos] == '*') {
+      star_pos = pattern_pos++;
+      star_name_pos = name_pos;
+    } else if (std::string::npos != star_pos) {
+      pattern_pos = star_pos + 1;
+      name_pos = ++star_name_pos;
+    } else {
+      return false;
+    }
+  }
+  while (pattern_pos < pattern.length() && pattern[pattern_pos] == '*') {
+    ++pattern_pos;
+  }
+  return pattern_pos == pattern.length();
+}
+} // namespace
+
+int ObFileScanUtils::directory_match_count(const std::string &dir,
+                                           const std::string &pattern,
+                                           int64_t &match_count)
+{
+  int ret = OB_SUCCESS;
+  match_count = 0;
+  const int fd = open(dir.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+  DIR *directory = nullptr;
+  if (fd < 0) {
+    ret = ENOENT == errno ? OB_FILE_NOT_EXIST : OB_FILE_NOT_OPENED;
+  } else if (OB_ISNULL(directory = fdopendir(fd))) {
+    close(fd);
+    ret = OB_FILE_NOT_OPENED;
+  } else {
+    struct dirent *entry = nullptr;
+    while (OB_SUCC(ret) && OB_NOT_NULL(entry = readdir(directory))) {
+      if (0 == strcmp(entry->d_name, ".") || 0 == strcmp(entry->d_name, "..")) {
+        continue;
+      }
+      struct stat entry_stat;
+      if (0 != fstatat(dirfd(directory), entry->d_name, &entry_stat, AT_SYMLINK_NOFOLLOW)) {
+        continue;
+      }
+      if (!S_ISREG(entry_stat.st_mode)) {
+        continue;
+      }
+      const std::string name(entry->d_name);
+      if (pattern.empty() || utils_glob_match(pattern, name)) {
+        ++match_count;
+      }
+    }
+    closedir(directory);
+  }
+  return ret;
+}
+
 ObFileScanReader::ObFileScanReader()
-  : path_(), format_(ObFileFormat::INVALID), columns_(), projected_columns_(),
+  : path_(), format_(ObFileFormat::INVALID), options_(), columns_(), projected_columns_(),
     stream_buffer_(), stream_(), current_row_number_(0),
     csv_header_read_(false), expected_device_(0), expected_inode_(0),
     expected_file_size_(0), expected_modified_time_ns_(0), end_verified_(false), parquet_reader_()
@@ -1093,9 +1599,25 @@ int ObFileScanReader::open(const std::string &path,
                            const int64_t expected_modified_time_ns,
                            const std::vector<int64_t> &projected_column_idxs)
 {
+  ObFileReadOptions options;
+  return open(path, format, options, columns, expected_device, expected_inode,
+              expected_file_size, expected_modified_time_ns, projected_column_idxs);
+}
+
+int ObFileScanReader::open(const std::string &path,
+                           const ObFileFormat format,
+                           const ObFileReadOptions &options,
+                           const std::vector<ObFileColumnSchema> &columns,
+                           const uint64_t expected_device,
+                           const uint64_t expected_inode,
+                           const int64_t expected_file_size,
+                           const int64_t expected_modified_time_ns,
+                           const std::vector<int64_t> &projected_column_idxs)
+{
   int ret = OB_SUCCESS;
   path_ = path;
   format_ = format;
+  options_ = options;
   columns_ = columns;
   projected_columns_.assign(columns.size(), false);
   for (size_t i = 0; OB_SUCC(ret) && i < projected_column_idxs.size(); ++i) {
@@ -1169,14 +1691,21 @@ int ObFileScanReader::open_inner()
   csv_header_read_ = false;
   if (OB_FAIL(ret)) {
   } else if (ObFileFormat::CSV == format_) {
-    std::vector<std::string> header;
-    bool has_record = false;
-    if (OB_FAIL(read_csv_record(*stream_, header, has_record))) {
-      LOG_WARN("failed to read csv header", K(ret));
-    } else if (header.size() != columns_.size()) {
-      ret = OB_INVALID_DATA;
-    } else {
+    if (OB_FAIL(skip_physical_lines(*stream_, options_.skip_rows_))) {
+      LOG_WARN("failed to skip csv rows before header", K(ret), K(options_.skip_rows_));
+    } else if (!options_.header_) {
       csv_header_read_ = true;
+    } else {
+      std::vector<std::string> header;
+      std::vector<bool> header_quoted;
+      bool has_record = false;
+      if (OB_FAIL(read_csv_record(*stream_, options_, header, header_quoted, has_record))) {
+        LOG_WARN("failed to read csv header", K(ret));
+      } else if (header.size() != columns_.size()) {
+        ret = OB_INVALID_DATA;
+      } else {
+        csv_header_read_ = true;
+      }
     }
   }
   return ret;
@@ -1225,23 +1754,52 @@ int ObFileScanReader::get_next_csv_row(std::vector<ObFileCell> &cells)
 {
   int ret = OB_SUCCESS;
   std::vector<std::string> fields;
+  std::vector<bool> quoted;
   bool has_record = false;
   cells.assign(columns_.size(), ObFileCell());
   if (!csv_header_read_) {
     ret = OB_NOT_INIT;
-  } else if (OB_FAIL(read_csv_record(*stream_, fields, has_record))) {
-    // return iterator end or parse error
-  } else if (fields.size() > columns_.size()) {
-    ret = OB_INVALID_DATA;
   } else {
-    ++current_row_number_;
-    for (size_t i = 0; OB_SUCC(ret) && i < fields.size(); ++i) {
-      if (projected_columns_[i]) {
-        const ParsedValue value = parse_csv_value(fields[i]);
-        if (OB_FAIL(convert_value(value, columns_[i].type_, cells[i]))) {
-          LOG_WARN("failed to convert csv field", K(ret), K(i), K(current_row_number_));
+    while (OB_SUCC(ret)) {
+      fields.clear();
+      quoted.clear();
+      has_record = false;
+      const int read_ret = read_csv_record(*stream_, options_, fields, quoted, has_record);
+      if (OB_ITER_END == read_ret) {
+        ret = OB_ITER_END;
+        break;
+      } else if (OB_FAIL(read_ret)) {
+        ret = read_ret;
+        break;
+      }
+      ++current_row_number_;
+      if (fields.size() != columns_.size()) {
+        if (options_.ignore_errors_) {
+          continue;
+        }
+        ret = OB_ERR_WRONG_VALUE_COUNT_ON_ROW;
+        LOG_WARN("csv field count mismatch", K(ret), K(current_row_number_),
+                 "expected", columns_.size(), "actual", fields.size());
+        LOG_USER_ERROR(OB_ERR_WRONG_VALUE_COUNT_ON_ROW,
+                       static_cast<int>(current_row_number_));
+        break;
+      }
+      cells.assign(columns_.size(), ObFileCell());
+      for (size_t i = 0; OB_SUCC(ret) && i < fields.size(); ++i) {
+        if (projected_columns_[i]) {
+          const ParsedValue value = parse_csv_value(
+            fields[i], i < quoted.size() && quoted[i], options_.null_string_);
+          if (OB_FAIL(convert_value(value, columns_[i].type_, cells[i]))) {
+            if (options_.ignore_errors_) {
+              cells[i].reset();
+              ret = OB_SUCCESS;
+            } else {
+              LOG_WARN("failed to convert csv field", K(ret), K(i), K(current_row_number_));
+            }
+          }
         }
       }
+      break;
     }
   }
   return ret;

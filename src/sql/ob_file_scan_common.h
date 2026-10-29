@@ -76,7 +76,10 @@ struct ObFileTableDef
   ObFileTableDef()
     : kind_(ObFileTableKind::INVALID), canonical_path_(), glob_pattern_(), secure_file_priv_(),
       format_(ObFileFormat::INVALID), columns_(), source_columns_(), estimated_rows_(0), device_(0),
-      inode_(0), file_size_(0), modified_time_ns_(0)
+      inode_(0), file_size_(0), modified_time_ns_(0),
+      header_(true), header_specified_(false), delimiter_(','), delimiter_specified_(false),
+      quote_('"'), has_quote_(true), escape_('"'), has_escape_(true),
+      skip_rows_(0), ignore_errors_(false), null_string_(), has_explicit_columns_(false)
   {}
 
   ObFileTableKind kind_;
@@ -91,9 +94,24 @@ struct ObFileTableDef
   uint64_t inode_;
   int64_t file_size_;
   int64_t modified_time_ns_;
+  bool header_;
+  bool header_specified_;
+  int32_t delimiter_;
+  bool delimiter_specified_;
+  int32_t quote_;
+  bool has_quote_;
+  int32_t escape_;
+  bool has_escape_;
+  int64_t skip_rows_;
+  bool ignore_errors_;
+  common::ObString null_string_;
+  bool has_explicit_columns_;
   TO_STRING_KV(K_(kind), K_(canonical_path), K_(glob_pattern), K_(secure_file_priv), K_(format),
                K_(columns), K_(source_columns),
-               K_(estimated_rows), K_(device), K_(inode), K_(file_size), K_(modified_time_ns));
+               K_(estimated_rows), K_(device), K_(inode), K_(file_size), K_(modified_time_ns),
+               K_(header), K_(header_specified), K_(delimiter), K_(delimiter_specified),
+               K_(quote), K_(has_quote), K_(escape), K_(has_escape), K_(skip_rows),
+               K_(ignore_errors), K_(null_string), K_(has_explicit_columns));
 };
 
 } // namespace sql

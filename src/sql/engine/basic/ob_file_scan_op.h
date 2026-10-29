@@ -31,9 +31,12 @@ class ObFileScanSpec : public ObOpSpec
 public:
   ObFileScanSpec(common::ObIAllocator &alloc, const ObPhyOperatorType type)
     : ObOpSpec(alloc, type), kind_(static_cast<int32_t>(ObFileTableKind::INVALID)),
-      file_path_(), glob_pattern_(), secure_file_priv_(),
+      file_path_(), glob_pattern_(), secure_file_priv_(), null_string_(),
       file_format_(static_cast<int32_t>(ObFileFormat::INVALID)),
       device_(0), inode_(0), file_size_(0), modified_time_ns_(0),
+      header_(true), header_specified_(false), delimiter_(','), delimiter_specified_(false),
+      quote_('"'), has_quote_(true), escape_('"'), has_escape_(true),
+      skip_rows_(0), ignore_errors_(false), has_explicit_columns_(false),
       file_column_names_(alloc), file_column_types_(alloc),
       source_column_names_(alloc), source_original_names_(alloc),
       source_type_names_(alloc), source_column_types_(alloc), source_column_nullable_(alloc),
@@ -44,11 +47,23 @@ public:
   common::ObString file_path_;
   common::ObString glob_pattern_;
   common::ObString secure_file_priv_;
+  common::ObString null_string_;
   int32_t file_format_;
   uint64_t device_;
   uint64_t inode_;
   int64_t file_size_;
   int64_t modified_time_ns_;
+  bool header_;
+  bool header_specified_;
+  int32_t delimiter_;
+  bool delimiter_specified_;
+  int32_t quote_;
+  bool has_quote_;
+  int32_t escape_;
+  bool has_escape_;
+  int64_t skip_rows_;
+  bool ignore_errors_;
+  bool has_explicit_columns_;
   common::ObFixedArray<common::ObString, common::ObIAllocator> file_column_names_;
   common::ObFixedArray<int32_t, common::ObIAllocator> file_column_types_;
   common::ObFixedArray<common::ObString, common::ObIAllocator> source_column_names_;

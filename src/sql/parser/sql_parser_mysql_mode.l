@@ -100,6 +100,35 @@ mysql_compatible_comment_without_version \/\*\!
 mysql_compatible_comment_end \*\/
 
 %%
+[Cc][Oo][Ll][Uu][Mm][Nn][Ss][ \t\r\n]*=[ \t\r\n]*\{[^}]*\} {
+  // Capture the explicit column schema as one token. The inner text is
+  // parsed by the resolver ("name TYPE, name TYPE, ...").
+  ParseResult *p = (ParseResult *)yyextra;
+  check_value(yylval);
+  const char *lbrace = strchr(yytext, '{');
+  const char *rbrace = strrchr(yytext, '}');
+  const long long inner_len = (NULL != lbrace && NULL != rbrace && rbrace > lbrace)
+                              ? (long long)(rbrace - lbrace - 1) : 0;
+  ParseNode *name_node = NULL;
+  ParseNode *value_node = NULL;
+  ParseNode *option_node = NULL;
+  malloc_new_node(name_node, p->malloc_pool_, T_IDENT, 0);
+  name_node->str_value_ = parse_strndup("columns", 7, p->malloc_pool_);
+  check_malloc(name_node->str_value_);
+  name_node->str_len_ = 7;
+  malloc_new_node(value_node, p->malloc_pool_, T_VARCHAR, 0);
+  value_node->str_value_ = parse_strndup(lbrace + 1, inner_len, p->malloc_pool_);
+  check_malloc(value_node->str_value_);
+  value_node->str_len_ = (int32_t)inner_len;
+  option_node = new_node(p->malloc_pool_, T_LINK_NODE, 2);
+  check_malloc(option_node);
+  option_node->children_[0] = name_node;
+  option_node->children_[1] = value_node;
+  yylval->node = option_node;
+  yylval->node->sql_str_off_ = yylloc->first_column;
+  return FILE_COLUMNS_SPEC;
+}
+
 INTERVAL {
 
   ParseResult *p = (ParseResult *)yyextra;

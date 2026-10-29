@@ -5577,6 +5577,8 @@ int ObStaticEngineCG::generate_spec(ObLogFileScan &op, ObFileScanSpec &spec,
     LOG_WARN("failed to copy glob pattern", K(ret));
   } else if (OB_FAIL(ob_write_string(alloc, file_def->secure_file_priv_, spec.secure_file_priv_))) {
     LOG_WARN("failed to copy secure file privilege", K(ret));
+  } else if (OB_FAIL(ob_write_string(alloc, file_def->null_string_, spec.null_string_))) {
+    LOG_WARN("failed to copy null string", K(ret));
   } else {
     spec.kind_ = static_cast<int32_t>(file_def->kind_);
     spec.file_format_ = static_cast<int32_t>(file_def->format_);
@@ -5584,6 +5586,17 @@ int ObStaticEngineCG::generate_spec(ObLogFileScan &op, ObFileScanSpec &spec,
     spec.inode_ = file_def->inode_;
     spec.file_size_ = file_def->file_size_;
     spec.modified_time_ns_ = file_def->modified_time_ns_;
+    spec.header_ = file_def->header_;
+    spec.header_specified_ = file_def->header_specified_;
+    spec.delimiter_ = file_def->delimiter_;
+    spec.delimiter_specified_ = file_def->delimiter_specified_;
+    spec.quote_ = file_def->quote_;
+    spec.has_quote_ = file_def->has_quote_;
+    spec.escape_ = file_def->escape_;
+    spec.has_escape_ = file_def->has_escape_;
+    spec.skip_rows_ = file_def->skip_rows_;
+    spec.ignore_errors_ = file_def->ignore_errors_;
+    spec.has_explicit_columns_ = file_def->has_explicit_columns_;
     for (int64_t i = 0; OB_SUCC(ret) && i < file_def->columns_.count(); ++i) {
       ObString source_name;
       if (OB_FAIL(ob_write_string(alloc, file_def->columns_.at(i).source_name_, source_name))) {

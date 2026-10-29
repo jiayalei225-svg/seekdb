@@ -15,6 +15,9 @@
  */
 
 #define USING_LOG_PREFIX SQL_RESV
+#include <cctype>
+#include <cstring>
+
 #include "rust/config.h"
 #include "ob_dml_resolver.h"
 #include "sql/resolver/dml/ob_view_table_resolver.h"
@@ -107,7 +110,299 @@ int append_inferred_file_columns(ObIAllocator &allocator,
   return ret;
 }
 
-int validate_file_scan_options(const ParseNode *node)
+bool file_option_iequal(const std::string &left, const char *right)
+{
+  bool equal = nullptr != right && left.length() == std::strlen(right);
+  for (size_t i = 0; equal && i < left.length(); ++i) {
+    const char l = static_cast<char>(std::tolower(static_cast<unsigned char>(left[i])));
+    const char r = static_cast<char>(std::tolower(static_cast<unsigned char>(right[i])));
+    equal = l == r;
+  }
+  return equal;
+}
+
+bool is_minus_one_node(const ParseNode *node)
+{
+  bool minus_one = nullptr != node && T_INT == node->type_ && -1 == node->value_;
+  if (!minus_one && nullptr != node && T_OP_NEG == node->type_
+      && nullptr != node->children_ && 1 == node->num_child_
+      && nullptr != node->children_[0] && T_INT == node->children_[0]->type_
+      && 1 == node->children_[0]->value_) {
+    minus_one = true;
+  }
+  return minus_one;
+}
+
+int get_file_option_string(const ParseNode *node, std::string &value)
+{
+  int ret = OB_SUCCESS;
+  if (nullptr == node || (T_CHAR != node->type_ && T_VARCHAR != node->type_)
+      || node->str_len_ < 0 || (node->str_len_ > 0 && nullptr == node->str_value_)) {
+    ret = OB_INVALID_ARGUMENT;
+  } else {
+    value.assign(nullptr == node->str_value_ ? "" : node->str_value_,
+                 static_cast<size_t>(node->str_len_));
+  }
+  return ret;
+}
+
+int get_file_option_bool(const ParseNode *node, bool &value)
+{
+  int ret = OB_SUCCESS;
+  if (nullptr != node && T_BOOL == node->type_) {
+    value = 0 != node->value_;
+  } else if (nullptr != node && T_INT == node->type_
+             && (0 == node->value_ || 1 == node->value_)) {
+    value = 0 != node->value_;
+  } else {
+    ret = OB_INVALID_ARGUMENT;
+  }
+  return ret;
+}
+
+int append_explicit_file_column(const std::string &source_name,
+                                const std::string &type_name,
+                                std::vector<ObFileColumnSchema> &columns)
+{
+  int ret = OB_SUCCESS;
+  ObFileColumnSchema column;
+  column.source_name_ = source_name;
+  column.nullable_ = true;
+  if (source_name.empty() || type_name.empty()) {
+    ret = OB_INVALID_ARGUMENT;
+  } else if (OB_FAIL(ObFileScanUtils::parse_column_type(type_name, column.type_,
+                                                        column.max_length_))) {
+    LOG_WARN("unsupported explicit file column type", K(ret), "type", type_name.c_str());
+    LOG_USER_ERROR(OB_NOT_SUPPORTED, "file column type");
+  } else {
+    std::string candidate = source_name;
+    int64_t suffix = 2;
+    bool unique = false;
+    while (!unique) {
+      unique = true;
+      for (size_t j = 0; unique && j < columns.size(); ++j) {
+        bool same = candidate.length() == columns[j].column_name_.length();
+        for (size_t k = 0; same && k < candidate.length(); ++k) {
+          same = std::tolower(static_cast<unsigned char>(candidate[k]))
+                 == std::tolower(static_cast<unsigned char>(columns[j].column_name_[k]));
+        }
+        if (same) {
+          unique = false;
+          candidate = source_name + "__" + std::to_string(suffix++);
+        }
+      }
+    }
+    column.column_name_ = candidate;
+    column.source_type_name_ = std::string("EXPLICIT/")
+                             + ObFileScanUtils::column_type_name(column.type_);
+    if (columns.size() >= 1024) {
+      ret = OB_SIZE_OVERFLOW;
+    } else {
+      columns.push_back(column);
+    }
+  }
+  return ret;
+}
+
+int parse_file_columns_node(const ParseNode *node,
+                            std::vector<ObFileColumnSchema> &columns)
+{
+  int ret = OB_SUCCESS;
+  columns.clear();
+  if (nullptr == node) {
+    ret = OB_INVALID_ARGUMENT;
+  } else if (T_CHAR == node->type_ || T_VARCHAR == node->type_) {
+    if (nullptr == node->str_value_ || node->str_len_ < 0) {
+      ret = OB_INVALID_ARGUMENT;
+    } else {
+      const std::string spec(node->str_value_, node->str_len_);
+      size_t begin = 0;
+      while (OB_SUCC(ret) && begin <= spec.length()) {
+        size_t comma = spec.find(',', begin);
+        if (std::string::npos == comma) {
+          comma = spec.length();
+        }
+        std::string part = spec.substr(begin, comma - begin);
+        size_t part_begin = 0;
+        size_t part_end = part.length();
+        while (part_begin < part_end && std::isspace(static_cast<unsigned char>(part[part_begin]))) {
+          ++part_begin;
+        }
+        while (part_end > part_begin && std::isspace(static_cast<unsigned char>(part[part_end - 1]))) {
+          --part_end;
+        }
+        part = part.substr(part_begin, part_end - part_begin);
+        if (!part.empty()) {
+          size_t split = 0;
+          while (split < part.length() && !std::isspace(static_cast<unsigned char>(part[split]))) {
+            ++split;
+          }
+          const std::string name = part.substr(0, split);
+          size_t type_begin = split;
+          while (type_begin < part.length()
+                 && std::isspace(static_cast<unsigned char>(part[type_begin]))) {
+            ++type_begin;
+          }
+          ret = append_explicit_file_column(name, part.substr(type_begin), columns);
+        }
+        if (comma >= spec.length()) {
+          break;
+        }
+        begin = comma + 1;
+      }
+      if (OB_SUCC(ret) && columns.empty()) {
+        ret = OB_INVALID_ARGUMENT;
+      }
+    }
+  } else if (T_FILE_COLUMNS == node->type_) {
+    for (int64_t i = 0; OB_SUCC(ret) && i < node->num_child_; ++i) {
+      const ParseNode *def = node->children_[i];
+      if (nullptr == def || T_LINK_NODE != def->type_ || 2 != def->num_child_
+          || nullptr == def->children_ || nullptr == def->children_[0]
+          || nullptr == def->children_[1]
+          || nullptr == def->children_[0]->str_value_
+          || nullptr == def->children_[1]->str_value_) {
+        ret = OB_INVALID_ARGUMENT;
+      } else {
+        ret = append_explicit_file_column(
+          std::string(def->children_[0]->str_value_, def->children_[0]->str_len_),
+          std::string(def->children_[1]->str_value_, def->children_[1]->str_len_),
+          columns);
+      }
+    }
+  } else {
+    ret = OB_INVALID_ARGUMENT;
+  }
+  return ret;
+}
+
+bool file_option_allowed(const std::string &name, const ObFileFormat format)
+{
+  bool allowed = false;
+  if (ObFileFormat::CSV == format) {
+    allowed = file_option_iequal(name, "header")
+              || file_option_iequal(name, "delimiter")
+              || file_option_iequal(name, "quote")
+              || file_option_iequal(name, "escape")
+              || file_option_iequal(name, "null_string")
+              || file_option_iequal(name, "skip_rows")
+              || file_option_iequal(name, "sample_size")
+              || file_option_iequal(name, "ignore_errors")
+              || file_option_iequal(name, "columns");
+  } else if (ObFileFormat::JSONL == format) {
+    allowed = file_option_iequal(name, "format")
+              || file_option_iequal(name, "sample_size")
+              || file_option_iequal(name, "columns");
+  } else if (ObFileFormat::PARQUET == format) {
+    allowed = file_option_iequal(name, "columns");
+  }
+  return allowed;
+}
+
+int parse_one_file_option(const ParseNode *node,
+                          const ObFileFormat format,
+                          ObFileReadOptions &options,
+                          std::vector<ObFileColumnSchema> &columns,
+                          bool &has_explicit_columns)
+{
+  int ret = OB_SUCCESS;
+  const ParseNode *name_node = node->children_[0];
+  const ParseNode *value_node = node->children_[1];
+  if (nullptr == name_node || nullptr == name_node->str_value_
+      || name_node->str_len_ <= 0) {
+    ret = OB_INVALID_ARGUMENT;
+  } else {
+    const std::string name(name_node->str_value_, name_node->str_len_);
+    if (!file_option_allowed(name, format)) {
+      ret = OB_NOT_SUPPORTED;
+      LOG_WARN("unsupported file table option", K(ret), "option", name.c_str());
+      LOG_USER_ERROR(OB_NOT_SUPPORTED, "file table option");
+    } else if (file_option_iequal(name, "header")) {
+      bool header = false;
+      if (OB_FAIL(get_file_option_bool(value_node, header))) {
+      } else {
+        options.header_ = header;
+        options.header_specified_ = true;
+      }
+    } else if (file_option_iequal(name, "delimiter")) {
+      std::string delimiter;
+      if (OB_FAIL(get_file_option_string(value_node, delimiter))) {
+      } else if (1 != delimiter.length()) {
+        ret = OB_INVALID_ARGUMENT;
+      } else {
+        options.delimiter_ = delimiter[0];
+        options.delimiter_specified_ = true;
+      }
+    } else if (file_option_iequal(name, "quote")) {
+      std::string quote;
+      if (OB_FAIL(get_file_option_string(value_node, quote))) {
+      } else if (quote.length() > 1) {
+        ret = OB_INVALID_ARGUMENT;
+      } else if (quote.empty()) {
+        options.has_quote_ = false;
+      } else {
+        options.quote_ = quote[0];
+        options.has_quote_ = true;
+      }
+    } else if (file_option_iequal(name, "escape")) {
+      std::string escape;
+      if (OB_FAIL(get_file_option_string(value_node, escape))) {
+      } else if (escape.length() > 1) {
+        ret = OB_INVALID_ARGUMENT;
+      } else if (escape.empty()) {
+        options.has_escape_ = false;
+      } else {
+        options.escape_ = escape[0];
+        options.has_escape_ = true;
+      }
+    } else if (file_option_iequal(name, "null_string")) {
+      std::string null_string;
+      if (OB_FAIL(get_file_option_string(value_node, null_string))) {
+      } else {
+        options.null_string_ = null_string;
+      }
+    } else if (file_option_iequal(name, "skip_rows")) {
+      if (nullptr == value_node || T_INT != value_node->type_
+          || value_node->value_ < 0) {
+        ret = OB_INVALID_ARGUMENT;
+      } else {
+        options.skip_rows_ = value_node->value_;
+      }
+    } else if (file_option_iequal(name, "ignore_errors")) {
+      bool ignore_errors = false;
+      if (OB_FAIL(get_file_option_bool(value_node, ignore_errors))) {
+      } else {
+        options.ignore_errors_ = ignore_errors;
+      }
+    } else if (file_option_iequal(name, "sample_size")) {
+      if (!is_minus_one_node(value_node)) {
+        ret = OB_NOT_SUPPORTED;
+      }
+    } else if (file_option_iequal(name, "format")) {
+      std::string format_value;
+      if (OB_FAIL(get_file_option_string(value_node, format_value))) {
+      } else if (!file_option_iequal(format_value, "newline_delimited")
+                 && !file_option_iequal(format_value, "jsonl")) {
+        ret = OB_NOT_SUPPORTED;
+      }
+    } else if (file_option_iequal(name, "columns")) {
+      if (OB_FAIL(parse_file_columns_node(value_node, columns))) {
+        LOG_WARN("failed to parse explicit file columns", K(ret));
+      } else {
+        has_explicit_columns = true;
+      }
+    } else {
+      ret = OB_NOT_SUPPORTED;
+    }
+  }
+  return ret;
+}
+
+int parse_file_scan_options(const ParseNode *node,
+                            const ObFileFormat format,
+                            ObFileReadOptions &options,
+                            std::vector<ObFileColumnSchema> &columns,
+                            bool &has_explicit_columns)
 {
   int ret = OB_SUCCESS;
   if (nullptr == node) {
@@ -116,45 +411,14 @@ int validate_file_scan_options(const ParseNode *node)
              || nullptr == node->children_) {
     ret = OB_INVALID_ARGUMENT;
   } else if (nullptr != node->children_[0]
-             && T_IDENT == node->children_[0]->type_) {
-    const ParseNode *name_node = node->children_[0];
-    const ParseNode *value_node = node->children_[1];
-    const ObString name(static_cast<int32_t>(name_node->str_len_), name_node->str_value_);
-    if (name.case_compare("header") == 0) {
-      if (nullptr == value_node || T_BOOL != value_node->type_ || 0 == value_node->value_) {
-        ret = OB_NOT_SUPPORTED;
-      }
-    } else if (name.case_compare("sample_size") == 0) {
-      // Full-file schema inference is the only supported mode: sample_size
-      // must be the literal -1. The parser may fold it into T_INT(-1) or keep
-      // it as T_OP_NEG(T_INT(1)).
-      bool is_minus_one = nullptr != value_node && T_INT == value_node->type_
-                          && -1 == value_node->value_;
-      if (!is_minus_one && nullptr != value_node && T_OP_NEG == value_node->type_
-          && nullptr != value_node->children_ && 1 == value_node->num_child_
-          && nullptr != value_node->children_[0]
-          && T_INT == value_node->children_[0]->type_
-          && 1 == value_node->children_[0]->value_) {
-        is_minus_one = true;
-      }
-      if (!is_minus_one) {
-        ret = OB_NOT_SUPPORTED;
-      }
-    } else if (name.case_compare("format") == 0) {
-      if (nullptr == value_node || (T_CHAR != value_node->type_ && T_VARCHAR != value_node->type_)) {
-        ret = OB_INVALID_ARGUMENT;
-      } else {
-        const ObString format(static_cast<int32_t>(value_node->str_len_), value_node->str_value_);
-        if (format.case_compare("newline_delimited") != 0
-            && format.case_compare("jsonl") != 0) {
-          ret = OB_NOT_SUPPORTED;
-        }
-      }
-    } else {
-      ret = OB_NOT_SUPPORTED;
+             && T_LINK_NODE == node->children_[0]->type_) {
+    if (OB_FAIL(parse_file_scan_options(node->children_[0], format, options,
+                                        columns, has_explicit_columns))) {
+    } else if (OB_FAIL(parse_file_scan_options(node->children_[1], format, options,
+                                               columns, has_explicit_columns))) {
     }
-  } else if (OB_FAIL(validate_file_scan_options(node->children_[0]))) {
-  } else if (OB_FAIL(validate_file_scan_options(node->children_[1]))) {
+  } else if (OB_FAIL(parse_one_file_option(node, format, options,
+                                           columns, has_explicit_columns))) {
   }
   return ret;
 }
@@ -4209,9 +4473,6 @@ int ObDMLResolver::resolve_file_table_item(const ParseNode &parse_tree,
     LOG_WARN("file sql is disabled", K(ret));
     LOG_USER_ERROR(OB_NOT_SUPPORTED, "file table while enable_file_sql is OFF");
   } else if (FALSE_IT(alias_node = parse_tree.children_[expected_child_count - 1])) {
-  } else if (T_FILE_SCAN_TABLE == parse_tree.type_
-             && OB_FAIL(validate_file_scan_options(parse_tree.children_[2]))) {
-    LOG_WARN("unsupported file scan option", K(ret));
   } else if (T_CHAR != parse_tree.children_[0]->type_
              && T_VARCHAR != parse_tree.children_[0]->type_
              && !(T_QUESTIONMARK == parse_tree.children_[0]->type_
@@ -4243,6 +4504,15 @@ int ObDMLResolver::resolve_file_table_item(const ParseNode &parse_tree,
              && OB_FAIL(ObFileScanUtils::parse_format(
                std::string(format_name.ptr(), format_name.length()), requested_format))) {
     LOG_WARN("unsupported file scan format", K(ret), K(format_name));
+  }
+  ObFileReadOptions read_options;
+  std::vector<ObFileColumnSchema> explicit_columns;
+  bool has_explicit_columns = false;
+  if (OB_SUCC(ret) && T_FILE_SCAN_TABLE == parse_tree.type_
+      && OB_FAIL(parse_file_scan_options(parse_tree.children_[2], requested_format,
+                                         read_options, explicit_columns,
+                                         has_explicit_columns))) {
+    LOG_WARN("unsupported file scan option", K(ret));
   }
   if (OB_SUCC(ret)) {
     std::string requested_path(path.ptr(), path.length());
@@ -4279,22 +4549,69 @@ int ObDMLResolver::resolve_file_table_item(const ParseNode &parse_tree,
       if (OB_FAIL(ObFileScanUtils::get_directory_fingerprint(
                     input_path, canonical_path, device, inode, modified_time_ns))) {
         LOG_WARN("failed to fingerprint file list directory", K(ret), K(path));
+      } else if (OB_FAIL(ObFileScanUtils::directory_match_count(
+                   input_path, glob_pattern, row_count))) {
+        LOG_WARN("failed to enumerate glob matches", K(ret), "dir", input_path.c_str(), "pattern", glob_pattern.c_str());
+      } else if (0 == row_count) {
+        // DuckDB-compatible glob(): an empty match set maps to ER_PARSE_ERROR.
+        ret = OB_ERR_PARSE_SQL;
+        LOG_USER_ERROR(OB_ERR_PARSE_SQL, "glob()", 0, "", 0);
+        LOG_WARN("glob matched no files", K(ret), "dir", input_path.c_str(),
+                 "pattern", glob_pattern.c_str());
       }
     } else {
       table_kind = T_FILE_SCHEMA_TABLE == parse_tree.type_
                  ? ObFileTableKind::SCHEMA : ObFileTableKind::SCAN;
-      if (OB_FAIL(ObFileScanUtils::infer_schema(input_path,
-                                                requested_format,
-                                                columns,
-                                                row_count,
-                                                canonical_path,
-                                                actual_format,
-                                                device,
-                                                inode,
-                                                file_size,
-                                                modified_time_ns))) {
+      if (has_explicit_columns) {
+        if (OB_FAIL(ObFileScanUtils::validate_schema_source(input_path,
+                                                            requested_format,
+                                                            canonical_path,
+                                                            actual_format,
+                                                            device,
+                                                            inode,
+                                                            file_size,
+                                                            modified_time_ns))) {
+          LOG_WARN("failed to validate explicit file schema source", K(ret), K(path));
+        } else if (ObFileFormat::CSV == actual_format) {
+          // Resolve the CSV dialect (auto delimiter/header) even when the
+          // caller supplied an explicit schema.
+          std::vector<ObFileColumnSchema> scratch_columns;
+          int64_t scratch_row_count = 0;
+          ObFileReadOptions scratch_options = read_options;
+          if (OB_FAIL(ObFileScanUtils::infer_schema(input_path,
+                                                    actual_format,
+                                                    scratch_options,
+                                                    scratch_columns,
+                                                    scratch_row_count,
+                                                    canonical_path,
+                                                    actual_format,
+                                                    device,
+                                                    inode,
+                                                    file_size,
+                                                    modified_time_ns))) {
+            LOG_WARN("failed to resolve csv dialect for explicit schema", K(ret), K(path));
+          } else {
+            read_options.delimiter_ = scratch_options.delimiter_;
+            read_options.header_ = scratch_options.header_;
+            columns = explicit_columns;
+          }
+        } else {
+          columns = explicit_columns;
+        }
+      } else if (OB_FAIL(ObFileScanUtils::infer_schema(input_path,
+                                                       requested_format,
+                                                       read_options,
+                                                       columns,
+                                                       row_count,
+                                                       canonical_path,
+                                                       actual_format,
+                                                       device,
+                                                       inode,
+                                                       file_size,
+                                                       modified_time_ns))) {
         LOG_WARN("failed to infer file table schema", K(ret), K(path), K(format_name));
-      } else if (columns.empty()) {
+      }
+      if (OB_SUCC(ret) && columns.empty()) {
         ret = OB_INVALID_DATA;
         LOG_WARN("file table has no columns", K(ret), K(path));
       }
@@ -4313,12 +4630,27 @@ int ObDMLResolver::resolve_file_table_item(const ParseNode &parse_tree,
     file_def->inode_ = inode;
     file_def->file_size_ = file_size;
     file_def->modified_time_ns_ = modified_time_ns;
+    file_def->header_ = read_options.header_;
+    file_def->header_specified_ = read_options.header_specified_;
+    file_def->delimiter_ = static_cast<int32_t>(read_options.delimiter_);
+    file_def->delimiter_specified_ = read_options.delimiter_specified_;
+    file_def->quote_ = static_cast<int32_t>(read_options.quote_);
+    file_def->has_quote_ = read_options.has_quote_;
+    file_def->escape_ = static_cast<int32_t>(read_options.escape_);
+    file_def->has_escape_ = read_options.has_escape_;
+    file_def->skip_rows_ = read_options.skip_rows_;
+    file_def->ignore_errors_ = read_options.ignore_errors_;
+    file_def->has_explicit_columns_ = has_explicit_columns;
     ObString canonical_path_str(static_cast<int32_t>(canonical_path.length()), canonical_path.data());
     ObString glob_pattern_str(static_cast<int32_t>(glob_pattern.length()), glob_pattern.data());
+    ObString null_string_str(static_cast<int32_t>(read_options.null_string_.length()),
+                             read_options.null_string_.data());
     if (OB_FAIL(ob_write_string(*allocator_, canonical_path_str, file_def->canonical_path_))) {
       LOG_WARN("failed to copy canonical file path", K(ret));
     } else if (OB_FAIL(ob_write_string(*allocator_, glob_pattern_str, file_def->glob_pattern_))) {
       LOG_WARN("failed to copy glob pattern", K(ret));
+    } else if (OB_FAIL(ob_write_string(*allocator_, null_string_str, file_def->null_string_))) {
+      LOG_WARN("failed to copy null string", K(ret));
     } else if (OB_FAIL(ob_write_string(*allocator_, secure_file_priv, file_def->secure_file_priv_))) {
       LOG_WARN("failed to copy secure file privilege", K(ret));
     }
