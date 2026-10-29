@@ -53,6 +53,7 @@ SQL_PUBLIC_HEADER_ROOTS = [
     "monitor/ob_plan_info_manager.h",
     "monitor/ob_sql_stat_record.h",
     "monitor/show_trace/ob_show_trace.h",
+    "ob_file_scan_common.h",
     "ob_mysql_end_trans_cb.h",
     "ob_query_retry_ctrl.h",
     "ob_result_set.h",

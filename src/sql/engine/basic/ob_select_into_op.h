@@ -71,7 +71,9 @@ public:
       parallel_(1),
       buffer_size_(DEFAULT_BUFFER_SIZE),
       is_overwrite_(false),
-      external_properties_(alloc)
+      external_properties_(alloc),
+      header_names_(alloc),
+      is_copy_(false)
   {
   }
 
@@ -91,6 +93,8 @@ public:
   int64_t buffer_size_;
   bool is_overwrite_;
   ObExternalFileFormat::StringData external_properties_;
+  common::ObFixedArray<common::ObString, common::ObIAllocator> header_names_;
+  bool is_copy_;
   static const int64_t DEFAULT_MAX_FILE_SIZE = 256LL * 1024 * 1024;
   static const int64_t DEFAULT_BUFFER_SIZE = 1LL * 1024 * 1024;
 };
@@ -123,6 +127,10 @@ public:
       shared_buf_len_(0),
       use_shared_buf_(false),
       has_compress_(false),
+      null_str_(),
+      header_written_(false),
+      file_created_(false),
+      copy_finished_(false),
       external_properties_(),
       format_type_(ObExternalFileFormat::FormatType::CSV_FORMAT),
       block_id_(0),
@@ -254,6 +262,7 @@ private:
   int calc_outfile_path();
   int create_shared_buffer_for_data_writer();
   int create_the_only_data_writer(ObExternalFileWriter *&data_writer);
+  int write_header_csv(ObCsvFileWriter &data_writer);
   int new_data_writer(ObExternalFileWriter *&data_writer);
   int check_secure_file_path(ObString file_name);
   char *get_json_buf() { return json_buf_; }
@@ -288,6 +297,10 @@ private:
   int64_t shared_buf_len_;
   bool use_shared_buf_;
   bool has_compress_;
+  ObString null_str_;
+  bool header_written_;
+  bool file_created_;
+  bool copy_finished_;
   ObExternalFileFormat external_properties_;
   ObExternalFileFormat::FormatType format_type_;
   uint32_t block_id_;

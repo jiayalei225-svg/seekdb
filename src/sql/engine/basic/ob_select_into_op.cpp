@@ -17,7 +17,9 @@
 #define USING_LOG_PREFIX SQL_ENG
 
 #include <cmath>
+#include <cstdio>
 #include <memory>
+#include <string>
 
 #include "ob_select_into_op.h"
 #include "sql/engine/cmd/ob_variable_set_executor.h"
@@ -38,7 +40,7 @@ OB_SERIALIZE_MEMBER(ObSelectIntoOpInput, task_id_, sqc_id_);
 OB_SERIALIZE_MEMBER((ObSelectIntoSpec, ObOpSpec), into_type_, user_vars_, outfile_name_,
     field_str_, line_str_, closed_cht_, is_optional_, select_exprs_, is_single_, max_file_size_,
     escaped_cht_, cs_type_, parallel_, buffer_size_, is_overwrite_,
-    external_properties_);
+    external_properties_, header_names_, is_copy_);
 
 
 int ObSelectIntoOp::inner_open()
@@ -129,6 +131,7 @@ void ObSelectIntoOp::set_csv_format_options()
     cs_type_ = MY_SPEC.cs_type_;
   } else {
     is_optional_ = external_properties_.csv_format_.is_optional_;
+    null_str_ = external_properties_.csv_format_.null_string_;
     cs_type_ = ObCharset::get_default_collation(external_properties_.csv_format_.cs_type_);
     field_str_.set_varchar(external_properties_.csv_format_.field_term_str_);
     field_str_.set_collation_type(cs_type_);
@@ -228,6 +231,9 @@ int ObSelectIntoOp::inner_get_next_row()
   if (OB_ITER_END == ret || OB_SUCC(ret)) { // set affected rows
     phy_plan_ctx->set_affected_rows(row_count);
   }
+  if (OB_ITER_END == ret || (OB_SUCC(ret) && row_count >= top_limit_cnt_)) {
+    copy_finished_ = true;
+  }
   if (OB_FAIL(ret) && OB_ITER_END != ret) {
     need_commit_ = false;
   }
@@ -309,6 +315,9 @@ int ObSelectIntoOp::inner_get_next_batch(const int64_t max_row_cnt)
   } //end while
   if (OB_SUCC(ret)) { // set affected rows
     phy_plan_ctx->set_affected_rows(row_count);
+    if (is_iter_end || row_count >= top_limit_cnt_) {
+      copy_finished_ = true;
+    }
   }
   if (OB_FAIL(ret)) {
     need_commit_ = false;
@@ -326,6 +335,7 @@ int ObSelectIntoOp::inner_close()
 {
   int ret = OB_SUCCESS;
   if (OB_NOT_NULL(data_writer_) && OB_FAIL(data_writer_->close_data_writer())) {
+    copy_finished_ = false;
   }
   return ret;
 }
@@ -929,11 +939,20 @@ int ObSelectIntoOp::print_field(const ObObj &obj, ObCsvFileWriter &data_writer)
   if (need_enclose) {
     OZ(write_single_char_to_file(&char_enclose_, data_writer));
   }
-  if (!has_escape_) {
+  if (obj.is_null()) {
+    if (!null_str_.empty()) {
+      ObObj null_obj;
+      null_obj.set_varchar(null_str_);
+      null_obj.set_collation_type(cs_type_);
+      OZ(write_obj_to_file(null_obj, data_writer, false));
+    } else if (!MY_SPEC.is_copy_ && has_escape_) {
+      // Keep the legacy SELECT ... INTO OUTFILE representation.
+      OZ(write_single_char_to_file(&char_escape_, data_writer));
+      OZ(write_single_char_to_file(&char_n, data_writer));
+    }
+    // COPY without nullstr writes an empty field for SQL NULL.
+  } else if (!has_escape_) {
     OZ(write_obj_to_file(obj, data_writer, false));
-  } else if (obj.is_null()) {
-    OZ(write_single_char_to_file(&char_escape_, data_writer));
-    OZ(write_single_char_to_file(&char_n, data_writer));
   } else {
     OZ(write_obj_to_file(obj, data_writer, true));
   }
@@ -1231,7 +1250,11 @@ int ObSelectIntoOp::create_the_only_data_writer(ObExternalFileWriter *&data_writ
 {
   int ret = OB_SUCCESS;
   ObCsvFileWriter *csv_data_writer = NULL;
-  if (OB_FAIL(new_data_writer(data_writer))) {
+  if (OB_NOT_NULL(data_writer_)) {
+    // Reuse the writer across batch scans; otherwise O_EXCL would reject the
+    // second open of the same COPY target.
+    data_writer = data_writer_;
+  } else if (OB_FAIL(new_data_writer(data_writer))) {
   } else if (OB_ISNULL(data_writer)) {
     ret = OB_ERR_UNEXPECTED;
   } else {
@@ -1240,11 +1263,49 @@ int ObSelectIntoOp::create_the_only_data_writer(ObExternalFileWriter *&data_writ
   }
   if (OB_FAIL(ret)) {
   } else if (T_INTO_OUTFILE == MY_SPEC.into_type_ && MY_SPEC.is_single_
-             && OB_FAIL(data_writer->open_file())) {
-  } else if (ObExternalFileFormat::FormatType::CSV_FORMAT == format_type_ && MY_SPEC.buffer_size_ > 0) {
-    csv_data_writer = static_cast<ObCsvFileWriter*>(data_writer);
-    if (OB_FAIL(csv_data_writer->alloc_buf(ctx_.get_allocator(), MY_SPEC.buffer_size_))) {
+             && !file_created_) {
+    if (OB_FAIL(data_writer->open_file())) {
+    } else {
+      file_created_ = true;
     }
+  }
+  if (OB_SUCC(ret) && ObExternalFileFormat::FormatType::CSV_FORMAT == format_type_) {
+    csv_data_writer = static_cast<ObCsvFileWriter*>(data_writer);
+    if (MY_SPEC.buffer_size_ > 0 && !use_shared_buf_
+        && NULL == csv_data_writer->get_buf()
+        && OB_FAIL(csv_data_writer->alloc_buf(ctx_.get_allocator(), MY_SPEC.buffer_size_))) {
+      LOG_WARN("failed to allocate csv writer buffer", K(ret));
+    }
+  }
+  if (OB_SUCC(ret) && NULL != csv_data_writer && !header_written_
+      && external_properties_.csv_format_.with_header_) {
+    if (OB_FAIL(write_header_csv(*csv_data_writer))) {
+      LOG_WARN("failed to write copy header", K(ret));
+    } else {
+      header_written_ = true;
+    }
+  }
+  return ret;
+}
+
+int ObSelectIntoOp::write_header_csv(ObCsvFileWriter &data_writer)
+{
+  int ret = OB_SUCCESS;
+  ObObj obj;
+  for (int64_t i = 0; OB_SUCC(ret) && i < MY_SPEC.header_names_.count(); ++i) {
+    obj.reset();
+    obj.set_varchar(MY_SPEC.header_names_.at(i));
+    obj.set_collation_type(cs_type_);
+    if (OB_FAIL(write_obj_to_file(obj, data_writer, false))) {
+      LOG_WARN("failed to write copy header field", K(ret), K(i));
+    } else if (i != MY_SPEC.header_names_.count() - 1
+               && OB_FAIL(write_obj_to_file(field_str_, data_writer))) {
+      LOG_WARN("failed to write copy header field terminator", K(ret));
+    }
+  }
+  if (OB_SUCC(ret) && MY_SPEC.header_names_.count() > 0
+      && OB_FAIL(write_obj_to_file(line_str_, data_writer))) {
+    LOG_WARN("failed to write copy header line terminator", K(ret));
   }
   return ret;
 }
@@ -1275,6 +1336,14 @@ int ObSelectIntoOp::new_data_writer(ObExternalFileWriter *&data_writer)
 
 void ObSelectIntoOp::destroy()
 {
+  if (MY_SPEC.is_copy_ && file_created_ && !copy_finished_ && !basic_url_.empty()) {
+    // A COPY target must not be left behind when the query fails midway.
+    const std::string path(basic_url_.ptr(), basic_url_.length());
+    if (0 != std::remove(path.c_str())) {
+      LOG_WARN_RET(OB_ERR_UNEXPECTED, "failed to remove incomplete copy target",
+                   "path", path.c_str());
+    }
+  }
   if (OB_NOT_NULL(data_writer_)) {
     data_writer_->~ObExternalFileWriter();
   }

@@ -6471,7 +6471,9 @@ int ObResolverUtils::resolve_file_format(const ParseNode *node,
                                          ObResolverParams &params)
 {
   int ret = OB_SUCCESS;
-  if (OB_ISNULL(node) || node->num_child_ != 1 || OB_ISNULL(node->children_[0]) ||
+  if (OB_ISNULL(node)
+      || (node->num_child_ != 1 && T_COPY_NULLSTR != node->type_)
+      || OB_ISNULL(node->children_[0]) ||
       OB_ISNULL(params.session_info_) || OB_ISNULL(params.expr_factory_)) {
     ret = OB_ERR_UNEXPECTED;
   } else {
@@ -6633,6 +6635,56 @@ int ObResolverUtils::resolve_file_format(const ParseNode *node,
       }
       case T_IGNORE_LAST_EMPTY_COLUMN: {
         format.csv_format_.ignore_last_empty_col_ = node->children_[0]->value_;
+        break;
+      }
+      case T_COPY_HEADER: {
+        const ObString opt_name(node->children_[0]->str_len_, node->children_[0]->str_value_);
+        if (0 != opt_name.case_compare("header")) {
+          ret = OB_INVALID_ARGUMENT;
+          LOG_USER_ERROR(OB_INVALID_ARGUMENT, "unknown copy option");
+        } else {
+          format.csv_format_.with_header_ = true;
+        }
+        break;
+      }
+      case T_COPY_NULLSTR: {
+        const ObString opt_name(node->children_[0]->str_len_, node->children_[0]->str_value_);
+        ObString string_v;
+        if (OB_ISNULL(node->children_[1])) {
+          ret = OB_INVALID_ARGUMENT;
+        } else if (OB_FAIL(resolve_file_format_string_value(
+                     node->children_[1], format.csv_format_.cs_type_, params, string_v))) {
+        } else if (0 == opt_name.case_compare("nullstr")) {
+          if (string_v.length() > 64) {
+            ret = OB_INVALID_ARGUMENT;
+          } else {
+            format.csv_format_.null_string_ = string_v;
+          }
+        } else if (0 == opt_name.case_compare("quote")) {
+          if (string_v.length() > 1) {
+            ret = OB_WRONG_FIELD_TERMINATORS;
+          } else {
+            format.csv_format_.field_enclosed_char_ =
+                string_v.empty() ? INT64_MAX : string_v.ptr()[0];
+            format.csv_format_.is_optional_ = true;
+          }
+        } else if (0 == opt_name.case_compare("escape")) {
+          if (string_v.length() > 1) {
+            ret = OB_ERR_INVALID_ESCAPE_CHAR_LENGTH;
+          } else {
+            format.csv_format_.field_escaped_char_ =
+                string_v.empty() ? INT64_MAX : string_v.ptr()[0];
+          }
+        } else if (0 == opt_name.case_compare("delimiter")) {
+          if (string_v.empty()) {
+            ret = OB_INVALID_ARGUMENT;
+          } else {
+            format.csv_format_.field_term_str_ = string_v;
+          }
+        } else {
+          ret = OB_INVALID_ARGUMENT;
+          LOG_USER_ERROR(OB_INVALID_ARGUMENT, "unknown copy option");
+        }
         break;
       }
       default: {
