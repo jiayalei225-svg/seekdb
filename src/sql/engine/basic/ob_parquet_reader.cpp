@@ -92,7 +92,7 @@ enum ParquetPageType : int32_t
 enum LogicalAnnotation : int32_t
 {
   LA_NONE = 0, LA_STRING, LA_DATE, LA_TIMESTAMP_MILLIS, LA_TIMESTAMP_MICROS,
-  LA_TIMESTAMP_NANOS, LA_INTEGER, LA_UNSUPPORTED
+  LA_TIMESTAMP_NANOS, LA_INTEGER, LA_DECIMAL, LA_UNSUPPORTED
 };
 
 struct CompactCursor
@@ -282,6 +282,28 @@ bool parse_timestamp_type(CompactCursor &cursor, int32_t &annotation)
   return ok && found_unit;
 }
 
+bool parse_decimal_type(CompactCursor &cursor, SchemaElement &element)
+{
+  bool ok = true, found_scale = false, found_precision = false;
+  int16_t last = 0, id = 0;
+  uint8_t type = 0;
+  do {
+    ok = cursor.read_field(last, id, type);
+    int64_t value = 0;
+    if (!ok || CT_STOP == type) {
+    } else if (1 == id && read_integer(cursor, type, value)) {
+      element.scale_ = static_cast<int32_t>(value);
+      found_scale = true;
+    } else if (2 == id && read_integer(cursor, type, value)) {
+      element.precision_ = static_cast<int32_t>(value);
+      found_precision = true;
+    } else {
+      ok = cursor.skip(type);
+    }
+  } while (ok && CT_STOP != type);
+  return ok && found_scale && found_precision;
+}
+
 bool parse_integer_type(CompactCursor &cursor, SchemaElement &element)
 {
   bool ok = true, found_width = false, found_signed = false;
@@ -320,6 +342,10 @@ bool parse_logical_type(CompactCursor &cursor, SchemaElement &element)
         element.logical_annotation_ = 1 == id ? LA_STRING : LA_DATE;
         found = true;
       }
+    } else if (5 == id) {
+      ok = parse_decimal_type(cursor, element);
+      element.logical_annotation_ = LA_DECIMAL;
+      found = ok;
     } else if (8 == id) {
       ok = parse_timestamp_type(cursor, element.logical_annotation_);
       found = ok;
@@ -611,6 +637,22 @@ int map_schema(const FileMeta &meta, std::vector<ObFileColumnSchema> &columns)
                || (LA_INTEGER == element.logical_annotation_
                    && !element.integer_signed_ && 64 == element.integer_bit_width_)) {
       ret = OB_NOT_SUPPORTED;
+    } else if (5 == element.converted_type_
+               || LA_DECIMAL == element.logical_annotation_) {
+      const bool supported_physical = PT_INT32 == element.physical_type_
+                                   || PT_INT64 == element.physical_type_
+                                   || PT_BYTE_ARRAY == element.physical_type_
+                                   || PT_FIXED_LEN_BYTE_ARRAY == element.physical_type_;
+      if (!supported_physical || element.precision_ <= 0 || element.scale_ < 0
+          || element.scale_ > element.precision_
+          || (PT_FIXED_LEN_BYTE_ARRAY == element.physical_type_ && element.type_length_ <= 0)) {
+        ret = OB_NOT_SUPPORTED;
+      } else {
+        column.type_ = ObFileColumnType::VARCHAR;
+        column.max_length_ = static_cast<int64_t>(element.precision_) + 3;
+        column.source_type_name_ = "DECIMAL(" + std::to_string(element.precision_)
+                                 + "," + std::to_string(element.scale_) + ")";
+      }
     } else if (PT_BOOLEAN == element.physical_type_) {
       column.type_ = ObFileColumnType::BOOLEAN;
       column.source_type_name_ = "BOOLEAN";
@@ -618,6 +660,9 @@ int map_schema(const FileMeta &meta, std::vector<ObFileColumnSchema> &columns)
       column.type_ = (6 == element.converted_type_ || LA_DATE == element.logical_annotation_)
                    ? ObFileColumnType::DATE : ObFileColumnType::BIGINT;
       column.source_type_name_ = ObFileColumnType::DATE == column.type_ ? "INT32/DATE" : "INT32";
+      if (ObFileColumnType::DATE == column.type_) {
+        column.max_length_ = 10;
+      }
     } else if (PT_INT64 == element.physical_type_) {
       column.type_ = (9 == element.converted_type_ || 10 == element.converted_type_
                       || LA_TIMESTAMP_MILLIS == element.logical_annotation_
@@ -633,8 +678,13 @@ int map_schema(const FileMeta &meta, std::vector<ObFileColumnSchema> &columns)
       } else {
         column.source_type_name_ = "INT64";
       }
+      if (ObFileColumnType::DATETIME == column.type_) {
+        column.max_length_ = (9 == element.converted_type_
+                              || LA_TIMESTAMP_MILLIS == element.logical_annotation_) ? 23 : 26;
+      }
     } else if (PT_INT96 == element.physical_type_) {
       column.type_ = ObFileColumnType::DATETIME;
+      column.max_length_ = 26;
       column.source_type_name_ = "INT96";
     } else if (PT_FLOAT == element.physical_type_ || PT_DOUBLE == element.physical_type_) {
       column.type_ = ObFileColumnType::DOUBLE;
@@ -990,6 +1040,96 @@ int decode_levels(const uint8_t *data, const size_t size, const size_t value_cou
   return ret;
 }
 
+bool is_decimal_schema(const SchemaElement &schema)
+{
+  return 5 == schema.converted_type_ || LA_DECIMAL == schema.logical_annotation_;
+}
+
+void format_decimal_digits(const bool negative,
+                           const std::string &digits,
+                           const int32_t scale,
+                           std::string &out)
+{
+  out.clear();
+  if (negative) {
+    out.push_back('-');
+  }
+  if (scale <= 0) {
+    out.append(digits);
+  } else if (digits.length() <= static_cast<size_t>(scale)) {
+    out.append("0.");
+    out.append(static_cast<size_t>(scale) - digits.length(), '0');
+    out.append(digits);
+  } else {
+    const size_t integer_length = digits.length() - static_cast<size_t>(scale);
+    out.append(digits, 0, integer_length);
+    out.push_back('.');
+    out.append(digits, integer_length, std::string::npos);
+  }
+}
+
+void format_decimal_int(const int64_t value, const int32_t scale, std::string &out)
+{
+  const bool negative = value < 0;
+  const uint64_t magnitude = negative
+      ? static_cast<uint64_t>(-(value + 1)) + 1ULL
+      : static_cast<uint64_t>(value);
+  format_decimal_digits(negative, std::to_string(magnitude), scale, out);
+}
+
+void format_decimal_bytes(const uint8_t *data,
+                          const size_t length,
+                          const int32_t scale,
+                          std::string &out)
+{
+  if (0 == length) {
+    out.assign("0");
+    return;
+  }
+  const bool negative = 0 != (data[0] & 0x80);
+  std::vector<uint8_t> magnitude(data, data + length);
+  if (negative) {
+    int carry = 1;
+    for (size_t i = magnitude.size(); i > 0; --i) {
+      const int value = static_cast<int>(static_cast<uint8_t>(~magnitude[i - 1])) + carry;
+      magnitude[i - 1] = static_cast<uint8_t>(value & 0xFF);
+      carry = value >> 8;
+    }
+  }
+  // Little-endian base 1e9 limbs; exactly representable in uint32_t.
+  static const uint32_t BASE = 1000000000U;
+  std::vector<uint32_t> limbs(1, 0);
+  for (size_t i = 0; i < magnitude.size(); ++i) {
+    uint64_t carry = magnitude[i];
+    for (size_t j = 0; j < limbs.size(); ++j) {
+      const uint64_t current = static_cast<uint64_t>(limbs[j]) * 256ULL + carry;
+      limbs[j] = static_cast<uint32_t>(current % BASE);
+      carry = current / BASE;
+    }
+    while (carry > 0) {
+      limbs.push_back(static_cast<uint32_t>(carry % BASE));
+      carry /= BASE;
+    }
+  }
+  size_t top = limbs.size();
+  while (top > 1 && 0 == limbs[top - 1]) {
+    --top;
+  }
+  const bool is_zero = 1 == top && 0 == limbs[0];
+  std::string digits;
+  if (is_zero) {
+    digits.assign("0");
+  } else {
+    digits.append(std::to_string(limbs[top - 1]));
+    char buffer[16];
+    for (size_t i = top - 1; i > 0; --i) {
+      snprintf(buffer, sizeof(buffer), "%09u", limbs[i - 1]);
+      digits.append(buffer);
+    }
+  }
+  format_decimal_digits(negative && !is_zero, digits, scale, out);
+}
+
 int decode_plain_values(const uint8_t *data, const size_t size, const size_t value_count,
                         const SchemaElement &schema, std::vector<ObFileCell> &values,
                         size_t &consumed)
@@ -1012,8 +1152,13 @@ int decode_plain_values(const uint8_t *data, const size_t size, const size_t val
         if (size - consumed < 4) ret = OB_INVALID_DATA;
         else {
           const int32_t value = static_cast<int32_t>(load_u32(data + consumed));
-          if (6 == schema.converted_type_ || LA_DATE == schema.logical_annotation_) cell.date_value_ = value;
-          else cell.int_value_ = value;
+          if (is_decimal_schema(schema)) {
+            format_decimal_int(value, schema.scale_, cell.string_value_);
+          } else if (6 == schema.converted_type_ || LA_DATE == schema.logical_annotation_) {
+            cell.date_value_ = value;
+          } else {
+            cell.int_value_ = value;
+          }
           consumed += 4;
         }
         break;
@@ -1021,7 +1166,9 @@ int decode_plain_values(const uint8_t *data, const size_t size, const size_t val
         if (size - consumed < 8) ret = OB_INVALID_DATA;
         else {
           const int64_t value = static_cast<int64_t>(load_u64(data + consumed));
-          if (9 == schema.converted_type_ || LA_TIMESTAMP_MILLIS == schema.logical_annotation_) {
+          if (is_decimal_schema(schema)) {
+            format_decimal_int(value, schema.scale_, cell.string_value_);
+          } else if (9 == schema.converted_type_ || LA_TIMESTAMP_MILLIS == schema.logical_annotation_) {
             if (value > std::numeric_limits<int64_t>::max() / 1000L
                 || value < std::numeric_limits<int64_t>::min() / 1000L) ret = OB_SIZE_OVERFLOW;
             else cell.datetime_value_ = value * 1000L;
@@ -1073,7 +1220,11 @@ int decode_plain_values(const uint8_t *data, const size_t size, const size_t val
           consumed += 4;
           if (length > 16U * 1024U * 1024U || length > size - consumed) ret = OB_SIZE_OVERFLOW;
           else {
-            cell.string_value_.assign(reinterpret_cast<const char *>(data + consumed), length);
+            if (is_decimal_schema(schema)) {
+              format_decimal_bytes(data + consumed, length, schema.scale_, cell.string_value_);
+            } else {
+              cell.string_value_.assign(reinterpret_cast<const char *>(data + consumed), length);
+            }
             consumed += length;
           }
         }
@@ -1083,7 +1234,13 @@ int decode_plain_values(const uint8_t *data, const size_t size, const size_t val
         if (schema.type_length_ <= 0 || static_cast<size_t>(schema.type_length_) > size - consumed) {
           ret = OB_INVALID_DATA;
         } else {
-          cell.string_value_.assign(reinterpret_cast<const char *>(data + consumed), schema.type_length_);
+          if (is_decimal_schema(schema)) {
+            format_decimal_bytes(data + consumed, static_cast<size_t>(schema.type_length_),
+                                 schema.scale_, cell.string_value_);
+          } else {
+            cell.string_value_.assign(reinterpret_cast<const char *>(data + consumed),
+                                      schema.type_length_);
+          }
           consumed += schema.type_length_;
         }
         break;
@@ -1318,10 +1475,43 @@ int ObParquetReader::Impl::decode_column(const RowGroupMeta &group, const size_t
                   }
                 }
               }
+            } else if (OB_SUCC(ret) && PE_RLE == header.encoding_
+                       && PT_BOOLEAN == schema.physical_type_) {
+              // Parquet RLE-encoded booleans: 4-byte length + hybrid stream.
+              if (0 == present_count) {
+                // All values in this page are null.
+              } else if (encoded_values_size < 4) {
+                ret = OB_INVALID_DATA;
+              } else {
+                const uint32_t rle_size = load_u32(encoded_values);
+                if (rle_size > encoded_values_size - 4) {
+                  ret = OB_INVALID_DATA;
+                } else {
+                  std::vector<uint32_t> bits;
+                  if (OB_FAIL(decode_hybrid(encoded_values + 4, rle_size, 1,
+                                            present_count, bits))) {
+                  } else {
+                    for (size_t i = 0; OB_SUCC(ret) && i < bits.size(); ++i) {
+                      if (bits[i] > 1) {
+                        ret = OB_INVALID_DATA;
+                      } else {
+                        ObFileCell cell;
+                        cell.is_null_ = false;
+                        cell.bool_value_ = 0 != bits[i];
+                        present_values.push_back(cell);
+                      }
+                    }
+                  }
+                }
+              }
             } else if (OB_SUCC(ret)) {
               ret = OB_NOT_SUPPORTED;
             }
             if (OB_SUCC(ret) && PE_PLAIN == header.encoding_ && consumed != encoded_values_size) {
+              ret = OB_INVALID_DATA;
+            }
+            if (OB_SUCC(ret)
+                && present_values.size() != present_count) {
               ret = OB_INVALID_DATA;
             }
             if (OB_SUCC(ret)) {

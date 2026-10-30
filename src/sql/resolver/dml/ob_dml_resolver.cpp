@@ -4702,6 +4702,10 @@ int ObDMLResolver::resolve_file_table_item(const ParseNode &parse_tree,
   if (OB_SUCC(ret)) {
     ObQueryHint &query_hint = stmt->get_query_ctx()->get_query_hint_for_update();
     ObGlobalHint &global_hint = const_cast<ObGlobalHint &>(query_hint.get_global_hint());
+    // File tables derive their schema from the file contents, so a cached plan
+    // would keep a stale schema after the file changes. Re-resolve on every
+    // execution; the scan spec still carries the file fingerprint so a change
+    // between resolve and execution is rejected instead of returning bad rows.
     global_hint.plan_cache_policy_ = OB_USE_PLAN_CACHE_NONE;
     tbl_item = item;
   }
