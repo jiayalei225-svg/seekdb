@@ -28,11 +28,13 @@
 #include <new>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <zlib.h>
 
 #ifdef _WIN32
 #include <io.h>
 #endif
 
+#include "lib/compress/zstd_1_3_8/ob_zstd_wrapper.h"
 #include "lib/oblog/ob_log.h"
 #include "share/ob_errno.h"
 
@@ -84,7 +86,10 @@ enum ParquetEncoding : int32_t
   PE_PLAIN = 0, PE_PLAIN_DICTIONARY = 2, PE_RLE = 3, PE_BIT_PACKED = 4,
   PE_RLE_DICTIONARY = 8
 };
-enum ParquetCodec : int32_t { PC_UNCOMPRESSED = 0, PC_SNAPPY = 1 };
+enum ParquetCodec : int32_t
+{
+  PC_UNCOMPRESSED = 0, PC_SNAPPY = 1, PC_GZIP = 2, PC_ZSTD = 6
+};
 enum ParquetPageType : int32_t
 {
   PP_DATA_PAGE = 0, PP_INDEX_PAGE = 1, PP_DICTIONARY_PAGE = 2, PP_DATA_PAGE_V2 = 3
@@ -1259,6 +1264,47 @@ int decompress_page(const int32_t codec, const uint8_t *data, const size_t compr
     else output.assign(data, data + compressed_size);
   } else if (PC_SNAPPY == codec) {
     ret = snappy_decompress(data, compressed_size, uncompressed_size, output);
+  } else if (PC_GZIP == codec) {
+    if (0 == uncompressed_size) {
+      output.clear();
+    } else if (compressed_size > static_cast<size_t>(std::numeric_limits<uInt>::max())
+               || uncompressed_size > static_cast<size_t>(std::numeric_limits<uInt>::max())) {
+      ret = OB_SIZE_OVERFLOW;
+    } else {
+      output.assign(uncompressed_size, 0);
+      z_stream stream;
+      memset(&stream, 0, sizeof(stream));
+      stream.next_in = const_cast<Bytef *>(reinterpret_cast<const Bytef *>(data));
+      stream.avail_in = static_cast<uInt>(compressed_size);
+      stream.next_out = reinterpret_cast<Bytef *>(output.data());
+      stream.avail_out = static_cast<uInt>(uncompressed_size);
+      // Parquet GZIP pages use the gzip wrapper (RFC 1952).
+      if (Z_OK != inflateInit2(&stream, 16 + MAX_WBITS)) {
+        ret = OB_IO_ERROR;
+      } else {
+        const int inflate_ret = inflate(&stream, Z_FINISH);
+        if (Z_STREAM_END != inflate_ret
+            || stream.total_out != uncompressed_size) {
+          ret = OB_INVALID_DATA;
+        }
+        inflateEnd(&stream);
+      }
+    }
+  } else if (PC_ZSTD == codec) {
+    if (0 == uncompressed_size) {
+      output.clear();
+    } else {
+      common::zstd_1_3_8::OB_ZSTD_customMem custom_mem = {nullptr, nullptr, nullptr};
+      output.assign(uncompressed_size, 0);
+      size_t decompressed_size = 0;
+      const int zstd_ret = common::zstd_1_3_8::ObZstdWrapper::decompress(
+          custom_mem, reinterpret_cast<const char *>(data), compressed_size,
+          reinterpret_cast<char *>(output.data()), uncompressed_size,
+          decompressed_size);
+      if (OB_SUCCESS != zstd_ret || decompressed_size != uncompressed_size) {
+        ret = OB_INVALID_DATA;
+      }
+    }
   } else {
     ret = OB_NOT_SUPPORTED;
   }

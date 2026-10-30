@@ -314,9 +314,10 @@ int parse_one_file_option(const ParseNode *node,
   } else {
     const std::string name(name_node->str_value_, name_node->str_len_);
     if (!file_option_allowed(name, format)) {
-      ret = OB_NOT_SUPPORTED;
+      ret = OB_NOT_SUPPORTED_FILE_OPTION;
       LOG_WARN("unsupported file table option", K(ret), "option", name.c_str());
-      LOG_USER_ERROR(OB_NOT_SUPPORTED, "file table option");
+      LOG_USER_ERROR(OB_NOT_SUPPORTED_FILE_OPTION,
+                     static_cast<int>(name.length()), name.c_str());
     } else if (file_option_iequal(name, "header")) {
       bool header = false;
       if (OB_FAIL(get_file_option_bool(value_node, header))) {
@@ -392,7 +393,9 @@ int parse_one_file_option(const ParseNode *node,
         has_explicit_columns = true;
       }
     } else {
-      ret = OB_NOT_SUPPORTED;
+      ret = OB_NOT_SUPPORTED_FILE_OPTION;
+      LOG_USER_ERROR(OB_NOT_SUPPORTED_FILE_OPTION,
+                     static_cast<int>(name.length()), name.c_str());
     }
   }
   return ret;

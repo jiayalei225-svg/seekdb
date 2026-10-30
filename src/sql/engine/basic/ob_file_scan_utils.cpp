@@ -684,6 +684,19 @@ int json_node_to_value(const ObIJsonBase &node, ParsedValue &value)
   return ret;
 }
 
+void report_jsonl_row_error(const int err, const int64_t row_number)
+{
+  if (OB_NOT_SUPPORTED == err) {
+    char buffer[96];
+    const int length = std::snprintf(buffer, sizeof(buffer),
+                                     "nested JSON value at row %lld",
+                                     static_cast<long long>(row_number));
+    if (length > 0) {
+      LOG_USER_ERROR(OB_NOT_SUPPORTED, buffer);
+    }
+  }
+}
+
 int parse_json_object(const std::string &line, std::vector<ParsedJsonField> &fields)
 {
   int ret = OB_SUCCESS;
@@ -1093,6 +1106,7 @@ int infer_jsonl_schema(const std::string &path,
     std::vector<ParsedJsonField> fields;
     if (OB_FAIL(parse_json_object(line, fields))) {
       LOG_WARN("failed to infer jsonl record", K(ret), K(row_count));
+      report_jsonl_row_error(ret, row_count + 1);
     } else {
       ++row_count;
       std::vector<bool> seen(columns.size(), false);
@@ -1834,6 +1848,7 @@ int ObFileScanReader::get_next_jsonl_row(std::vector<ObFileCell> &cells)
     cells.assign(columns_.size(), ObFileCell());
     if (OB_FAIL(parse_json_object(line, fields))) {
       LOG_WARN("failed to parse jsonl row", K(ret), K(current_row_number_));
+      report_jsonl_row_error(ret, current_row_number_);
     } else {
       for (size_t field_idx = 0; OB_SUCC(ret) && field_idx < fields.size(); ++field_idx) {
         for (size_t column_idx = 0; column_idx < columns_.size(); ++column_idx) {
