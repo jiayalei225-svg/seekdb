@@ -279,6 +279,7 @@ SchemaCache &schema_cache()
 static constexpr int64_t MAX_FILE_SIZE = 1024L * 1024L * 1024L;
 static constexpr int64_t MAX_COLUMN_COUNT = 1024;
 static constexpr int64_t MAX_FIELD_SIZE = 16L * 1024L * 1024L;
+static constexpr int64_t MAX_FIELD_COUNT = 65536;
 
 bool ascii_iequal(const std::string &left, const char *right)
 {
@@ -356,6 +357,10 @@ int read_csv_record(std::istream &stream,
       break;
     }
     has_record = true;
+    if (fields.size() > static_cast<size_t>(MAX_FIELD_COUNT)) {
+      ret = OB_SIZE_OVERFLOW;
+      break;
+    }
     const char ch = static_cast<char>(next);
     if (in_quotes) {
       if (0 != escape && escape != quote && ch == escape) {
